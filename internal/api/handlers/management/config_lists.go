@@ -450,7 +450,14 @@ func (h *Handler) PutOpenAICompat(c *gin.Context) {
 	filtered := make([]config.OpenAICompatibility, 0, len(arr))
 	for i := range arr {
 		normalizeOpenAICompatibilityEntry(&arr[i])
-		if strings.TrimSpace(arr[i].BaseURL) != "" {
+		hasPAT := false
+		for j := range arr[i].APIKeyEntries {
+			if strings.TrimSpace(arr[i].APIKeyEntries[j].APIKey) != "" {
+				hasPAT = true
+				break
+			}
+		}
+		if strings.TrimSpace(arr[i].BaseURL) != "" || hasPAT {
 			filtered = append(filtered, arr[i])
 		}
 	}
@@ -556,6 +563,135 @@ func (h *Handler) DeleteOpenAICompat(c *gin.Context) {
 		if err == nil && idx >= 0 && idx < len(h.cfg.OpenAICompatibility) {
 			h.cfg.OpenAICompatibility = append(h.cfg.OpenAICompatibility[:idx], h.cfg.OpenAICompatibility[idx+1:]...)
 			h.cfg.SanitizeOpenAICompatibility()
+			h.persistLocked(c)
+			return
+		}
+	}
+	c.JSON(400, gin.H{"error": "missing name or index"})
+}
+
+// qoder: []OpenAICompatibility
+func (h *Handler) GetQoderCompat(c *gin.Context) {
+	c.JSON(200, gin.H{"qoder": h.qoderCompatibilityWithAuthIndex()})
+}
+func (h *Handler) PutQoderCompat(c *gin.Context) {
+	data, err := c.GetRawData()
+	if err != nil {
+		c.JSON(400, gin.H{"error": "failed to read body"})
+		return
+	}
+	var arr []config.OpenAICompatibility
+	if err = json.Unmarshal(data, &arr); err != nil {
+		var obj struct {
+			Items []config.OpenAICompatibility `json:"items"`
+		}
+		if err2 := json.Unmarshal(data, &obj); err2 != nil || len(obj.Items) == 0 {
+			c.JSON(400, gin.H{"error": "invalid body"})
+			return
+		}
+		arr = obj.Items
+	}
+	filtered := make([]config.OpenAICompatibility, 0, len(arr))
+	for i := range arr {
+		normalizeOpenAICompatibilityEntry(&arr[i])
+		if strings.TrimSpace(arr[i].BaseURL) != "" {
+			filtered = append(filtered, arr[i])
+		}
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.cfg.Qoder = filtered
+	h.cfg.SanitizeQoderCompatibility()
+	h.persistLocked(c)
+}
+func (h *Handler) PatchQoderCompat(c *gin.Context) {
+	type qoderPatch struct {
+		Name          *string                             `json:"name"`
+		Prefix        *string                             `json:"prefix"`
+		Disabled      *bool                               `json:"disabled"`
+		BaseURL       *string                             `json:"base-url"`
+		APIKeyEntries *[]config.OpenAICompatibilityAPIKey `json:"api-key-entries"`
+		Models        *[]config.OpenAICompatibilityModel  `json:"models"`
+		Headers       *map[string]string                  `json:"headers"`
+	}
+	var body struct {
+		Name  *string     `json:"name"`
+		Index *int        `json:"index"`
+		Value *qoderPatch `json:"value"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil || body.Value == nil {
+		c.JSON(400, gin.H{"error": "invalid body"})
+		return
+	}
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	targetIndex := -1
+	if body.Index != nil && *body.Index >= 0 && *body.Index < len(h.cfg.Qoder) {
+		targetIndex = *body.Index
+	}
+	if targetIndex == -1 && body.Name != nil {
+		match := strings.TrimSpace(*body.Name)
+		for i := range h.cfg.Qoder {
+			if h.cfg.Qoder[i].Name == match {
+				targetIndex = i
+				break
+			}
+		}
+	}
+	if targetIndex == -1 {
+		c.JSON(404, gin.H{"error": "item not found"})
+		return
+	}
+
+	entry := h.cfg.Qoder[targetIndex]
+	if body.Value.Name != nil {
+		entry.Name = strings.TrimSpace(*body.Value.Name)
+	}
+	if body.Value.Prefix != nil {
+		entry.Prefix = strings.TrimSpace(*body.Value.Prefix)
+	}
+	if body.Value.Disabled != nil {
+		entry.Disabled = *body.Value.Disabled
+	}
+	if body.Value.BaseURL != nil {
+		entry.BaseURL = strings.TrimSpace(*body.Value.BaseURL)
+	}
+	if body.Value.APIKeyEntries != nil {
+		entry.APIKeyEntries = append([]config.OpenAICompatibilityAPIKey(nil), (*body.Value.APIKeyEntries)...)
+	}
+	if body.Value.Models != nil {
+		entry.Models = append([]config.OpenAICompatibilityModel(nil), (*body.Value.Models)...)
+	}
+	if body.Value.Headers != nil {
+		entry.Headers = config.NormalizeHeaders(*body.Value.Headers)
+	}
+	normalizeOpenAICompatibilityEntry(&entry)
+	h.cfg.Qoder[targetIndex] = entry
+	h.cfg.SanitizeQoderCompatibility()
+	h.persistLocked(c)
+}
+func (h *Handler) DeleteQoderCompat(c *gin.Context) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if name := c.Query("name"); name != "" {
+		out := make([]config.OpenAICompatibility, 0, len(h.cfg.Qoder))
+		for _, v := range h.cfg.Qoder {
+			if v.Name != name {
+				out = append(out, v)
+			}
+		}
+		h.cfg.Qoder = out
+		h.cfg.SanitizeQoderCompatibility()
+		h.persistLocked(c)
+		return
+	}
+	if idxStr := c.Query("index"); idxStr != "" {
+		var idx int
+		_, err := fmt.Sscanf(idxStr, "%d", &idx)
+		if err == nil && idx >= 0 && idx < len(h.cfg.Qoder) {
+			h.cfg.Qoder = append(h.cfg.Qoder[:idx], h.cfg.Qoder[idx+1:]...)
+			h.cfg.SanitizeQoderCompatibility()
 			h.persistLocked(c)
 			return
 		}

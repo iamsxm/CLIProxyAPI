@@ -405,8 +405,17 @@ func (e *OpenAICompatExecutor) resolveCompatConfig(auth *cliproxyauth.Auth) *con
 	if v := strings.TrimSpace(auth.Provider); v != "" {
 		candidates = append(candidates, v)
 	}
-	for i := range e.cfg.OpenAICompatibility {
-		compat := &e.cfg.OpenAICompatibility[i]
+	if compat := findOpenAICompatConfig(e.cfg.OpenAICompatibility, candidates); compat != nil {
+		return compat
+	}
+	return findOpenAICompatConfig(e.cfg.Qoder, candidates)
+}
+
+// findOpenAICompatConfig searches a list of OpenAI-compatible provider configs
+// by any known provider name candidate.
+func findOpenAICompatConfig(entries []config.OpenAICompatibility, candidates []string) *config.OpenAICompatibility {
+	for i := range entries {
+		compat := &entries[i]
 		if compat.Disabled {
 			continue
 		}

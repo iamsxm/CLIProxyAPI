@@ -764,8 +764,17 @@ func resolveOpenAICompatAPIKeyProxyURL(cfg *config.Config, auth *coreauth.Auth, 
 		candidates = append(candidates, v)
 	}
 
-	for i := range cfg.OpenAICompatibility {
-		compat := &cfg.OpenAICompatibility[i]
+	if proxyURL := resolveOpenAICompatProxyURLFromEntries(cfg.OpenAICompatibility, candidates, apiKey); proxyURL != "" {
+		return proxyURL
+	}
+	return resolveOpenAICompatProxyURLFromEntries(cfg.Qoder, candidates, apiKey)
+}
+
+// resolveOpenAICompatProxyURLFromEntries finds the per-key proxy configured for
+// OpenAI-compatible provider shapes, including the first-class native Qoder config.
+func resolveOpenAICompatProxyURLFromEntries(entries []config.OpenAICompatibility, candidates []string, apiKey string) string {
+	for i := range entries {
+		compat := &entries[i]
 		if compat.Disabled {
 			continue
 		}

@@ -624,6 +624,11 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.PATCH("/openai-compatibility", s.mgmt.PatchOpenAICompat)
 		mgmt.DELETE("/openai-compatibility", s.mgmt.DeleteOpenAICompat)
 
+		mgmt.GET("/qoder", s.mgmt.GetQoderCompat)
+		mgmt.PUT("/qoder", s.mgmt.PutQoderCompat)
+		mgmt.PATCH("/qoder", s.mgmt.PatchQoderCompat)
+		mgmt.DELETE("/qoder", s.mgmt.DeleteQoderCompat)
+
 		mgmt.GET("/vertex-api-key", s.mgmt.GetVertexCompatKeys)
 		mgmt.PUT("/vertex-api-key", s.mgmt.PutVertexCompatKeys)
 		mgmt.PATCH("/vertex-api-key", s.mgmt.PatchVertexCompatKey)
@@ -1111,9 +1116,17 @@ func (s *Server) UpdateClients(cfg *config.Config) {
 		}
 		openAICompatCount += len(entry.APIKeyEntries)
 	}
+	qoderCompatCount := 0
+	for i := range cfg.Qoder {
+		entry := cfg.Qoder[i]
+		if entry.Disabled {
+			continue
+		}
+		qoderCompatCount += len(entry.APIKeyEntries)
+	}
 
-	total := authEntries + geminiAPIKeyCount + claudeAPIKeyCount + codexAPIKeyCount + vertexAICompatCount + openAICompatCount
-	fmt.Printf("server clients and configuration updated: %d clients (%d auth entries + %d Gemini API keys + %d Claude API keys + %d Codex keys + %d Vertex-compat + %d OpenAI-compat)\n",
+	total := authEntries + geminiAPIKeyCount + claudeAPIKeyCount + codexAPIKeyCount + vertexAICompatCount + openAICompatCount + qoderCompatCount
+	fmt.Printf("server clients and configuration updated: %d clients (%d auth entries + %d Gemini API keys + %d Claude API keys + %d Codex keys + %d Vertex-compat + %d OpenAI-compat + %d Qoder)\n",
 		total,
 		authEntries,
 		geminiAPIKeyCount,
@@ -1121,6 +1134,7 @@ func (s *Server) UpdateClients(cfg *config.Config) {
 		codexAPIKeyCount,
 		vertexAICompatCount,
 		openAICompatCount,
+		qoderCompatCount,
 	)
 }
 

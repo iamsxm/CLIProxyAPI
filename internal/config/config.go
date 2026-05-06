@@ -121,6 +121,9 @@ type Config struct {
 	// OpenAICompatibility defines OpenAI API compatibility configurations for external providers.
 	OpenAICompatibility []OpenAICompatibility `yaml:"openai-compatibility" json:"openai-compatibility"`
 
+	// Qoder defines native Qoder PAT configurations exposed as a first-class provider.
+	Qoder []OpenAICompatibility `yaml:"qoder" json:"qoder"`
+
 	// VertexCompatAPIKey defines Vertex AI-compatible API key configurations for third-party providers.
 	// Used for services that use Vertex AI-style paths but with simple API key authentication.
 	VertexCompatAPIKey []VertexCompatKey `yaml:"vertex-api-key" json:"vertex-api-key"`
@@ -709,6 +712,9 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	// Sanitize OpenAI compatibility providers: drop entries without base-url
 	cfg.SanitizeOpenAICompatibility()
 
+	// Sanitize Qoder native providers: keep entries with PATs even when base-url is empty.
+	cfg.SanitizeQoderCompatibility()
+
 	// Normalize OAuth provider model exclusion map.
 	cfg.OAuthExcludedModels = NormalizeOAuthExcludedModels(cfg.OAuthExcludedModels)
 
@@ -875,6 +881,38 @@ func (cfg *Config) SanitizeOpenAICompatibility() {
 		out = append(out, e)
 	}
 	cfg.OpenAICompatibility = out
+}
+
+// SanitizeQoderCompatibility normalizes first-class Qoder native entries.
+// It reuses the OpenAI-compatible provider shape so existing config CRUD can
+// manage model aliases and per-key proxy settings while api-key stores the PAT.
+func (cfg *Config) SanitizeQoderCompatibility() {
+	if cfg == nil || len(cfg.Qoder) == 0 {
+		return
+	}
+	out := make([]OpenAICompatibility, 0, len(cfg.Qoder))
+	for i := range cfg.Qoder {
+		e := cfg.Qoder[i]
+		e.Name = strings.TrimSpace(e.Name)
+		if e.Name == "" {
+			e.Name = "qoder"
+		}
+		e.Prefix = normalizeModelPrefix(e.Prefix)
+		e.BaseURL = strings.TrimSpace(e.BaseURL)
+		e.Headers = NormalizeHeaders(e.Headers)
+		hasPAT := false
+		for j := range e.APIKeyEntries {
+			e.APIKeyEntries[j].APIKey = strings.TrimSpace(e.APIKeyEntries[j].APIKey)
+			if e.APIKeyEntries[j].APIKey != "" {
+				hasPAT = true
+			}
+		}
+		if !hasPAT && e.BaseURL == "" {
+			continue
+		}
+		out = append(out, e)
+	}
+	cfg.Qoder = out
 }
 
 // SanitizeCodexKeys removes Codex API key entries missing a BaseURL.

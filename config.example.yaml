@@ -266,6 +266,20 @@ nonstream-keepalive-interval: 0
 #       - name: "kimi-k2.5"
 #         alias: "claude-opus-4.66"
 
+# Qoder native provider
+# api-key-entries[].api-key stores the Qoder PAT. base-url is optional and
+# kept only for compatibility with the shared provider config shape.
+# qoder:
+#   - name: "qoder"
+#     disabled: false
+#     prefix: "qoder" # optional: call models as "qoder/qoder-lite" to avoid routing ambiguity
+#     base-url: ""
+#     api-key-entries:
+#       - api-key: "pt-xxxxxxxxxxxxxxxx"
+#     models:
+#       - name: "lite"
+#         alias: "qoder-lite"
+
 # Vertex API keys (Vertex-compatible endpoints, base-url is optional)
 # vertex-api-key:
 #   - api-key: "vk-123..."                        # x-goog-api-key header

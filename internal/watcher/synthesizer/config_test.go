@@ -369,6 +369,48 @@ func TestConfigSynthesizer_OpenAICompat(t *testing.T) {
 	}
 }
 
+func TestConfigSynthesizer_QoderCompat(t *testing.T) {
+	synth := NewConfigSynthesizer()
+	ctx := &SynthesisContext{
+		Config: &config.Config{
+			Qoder: []config.OpenAICompatibility{
+				{
+					Name:    "qoder",
+					BaseURL: "http://127.0.0.1:8963/v1",
+					APIKeyEntries: []config.OpenAICompatibilityAPIKey{
+						{APIKey: "local-qoder"},
+					},
+					Models: []config.OpenAICompatibilityModel{
+						{Name: "lite", Alias: "qoder-lite"},
+					},
+				},
+			},
+		},
+		Now:         time.Now(),
+		IDGenerator: NewStableIDGenerator(),
+	}
+
+	auths, err := synth.Synthesize(ctx)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(auths) != 1 {
+		t.Fatalf("expected 1 qoder auth, got %d", len(auths))
+	}
+	if auths[0].Provider != "qoder" {
+		t.Fatalf("expected provider qoder, got %s", auths[0].Provider)
+	}
+	if auths[0].Label != "qoder" {
+		t.Fatalf("expected label qoder, got %s", auths[0].Label)
+	}
+	if auths[0].Attributes["provider_key"] != "qoder" {
+		t.Fatalf("expected provider_key qoder, got %s", auths[0].Attributes["provider_key"])
+	}
+	if auths[0].Attributes["base_url"] != "http://127.0.0.1:8963/v1" {
+		t.Fatalf("expected qoder base_url to be preserved, got %s", auths[0].Attributes["base_url"])
+	}
+}
+
 func TestConfigSynthesizer_VertexCompat(t *testing.T) {
 	synth := NewConfigSynthesizer()
 	ctx := &SynthesisContext{

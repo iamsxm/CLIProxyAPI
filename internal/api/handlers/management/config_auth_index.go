@@ -45,6 +45,23 @@ type openAICompatibilityWithAuthIndex struct {
 	AuthIndex     string                                   `json:"auth-index,omitempty"`
 }
 
+type qoderCompatibilityAPIKeyWithAuthIndex struct {
+	config.OpenAICompatibilityAPIKey
+	AuthIndex string `json:"auth-index,omitempty"`
+}
+
+type qoderCompatibilityWithAuthIndex struct {
+	Name          string                                  `json:"name"`
+	Priority      int                                     `json:"priority,omitempty"`
+	Disabled      bool                                    `json:"disabled"`
+	Prefix        string                                  `json:"prefix,omitempty"`
+	BaseURL       string                                  `json:"base-url"`
+	APIKeyEntries []qoderCompatibilityAPIKeyWithAuthIndex `json:"api-key-entries,omitempty"`
+	Models        []config.OpenAICompatibilityModel       `json:"models,omitempty"`
+	Headers       map[string]string                       `json:"headers,omitempty"`
+	AuthIndex     string                                  `json:"auth-index,omitempty"`
+}
+
 func (h *Handler) liveAuthIndexByID() map[string]string {
 	out := map[string]string{}
 	if h == nil {
@@ -232,6 +249,56 @@ func (h *Handler) openAICompatibilityWithAuthIndex() []openAICompatibilityWithAu
 				apiKeyEntry := entry.APIKeyEntries[j]
 				id, _ := idGen.Next(idKind, apiKeyEntry.APIKey, entry.BaseURL, apiKeyEntry.ProxyURL)
 				response.APIKeyEntries[j] = openAICompatibilityAPIKeyWithAuthIndex{
+					OpenAICompatibilityAPIKey: apiKeyEntry,
+					AuthIndex:                 liveIndexByID[id],
+				}
+			}
+		}
+		out[i] = response
+	}
+	return out
+}
+
+func (h *Handler) qoderCompatibilityWithAuthIndex() []qoderCompatibilityWithAuthIndex {
+	if h == nil {
+		return nil
+	}
+	liveIndexByID := h.liveAuthIndexByID()
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.cfg == nil {
+		return nil
+	}
+
+	out := make([]qoderCompatibilityWithAuthIndex, len(h.cfg.Qoder))
+	idGen := synthesizer.NewStableIDGenerator()
+	for i := range h.cfg.Qoder {
+		entry := h.cfg.Qoder[i]
+		displayName := strings.TrimSpace(entry.Name)
+		if displayName == "" {
+			displayName = "qoder"
+		}
+
+		response := qoderCompatibilityWithAuthIndex{
+			Name:      entry.Name,
+			Priority:  entry.Priority,
+			Disabled:  entry.Disabled,
+			Prefix:    entry.Prefix,
+			BaseURL:   entry.BaseURL,
+			Models:    entry.Models,
+			Headers:   entry.Headers,
+			AuthIndex: "",
+		}
+		if len(entry.APIKeyEntries) == 0 {
+			id, _ := idGen.Next("qoder:bridge", displayName, entry.BaseURL)
+			response.AuthIndex = liveIndexByID[id]
+		} else {
+			response.APIKeyEntries = make([]qoderCompatibilityAPIKeyWithAuthIndex, len(entry.APIKeyEntries))
+			for j := range entry.APIKeyEntries {
+				apiKeyEntry := entry.APIKeyEntries[j]
+				id, _ := idGen.Next("qoder:apikey", displayName, apiKeyEntry.APIKey, entry.BaseURL, apiKeyEntry.ProxyURL)
+				response.APIKeyEntries[j] = qoderCompatibilityAPIKeyWithAuthIndex{
 					OpenAICompatibilityAPIKey: apiKeyEntry,
 					AuthIndex:                 liveIndexByID[id],
 				}

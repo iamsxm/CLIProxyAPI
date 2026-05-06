@@ -403,6 +403,12 @@ func (s *Service) ensureExecutorsForAuthWithMode(a *coreauth.Auth, forceReplace 
 		if compatProviderKey == "" {
 			compatProviderKey = "openai-compatibility"
 		}
+		// Qoder exposes OpenAI/Anthropic-compatible entrypoints, but its upstream
+		// protocol requires native PAT exchange, Qoder encoding, and COSY signing.
+		if strings.EqualFold(compatProviderKey, "qoder") {
+			s.coreManager.RegisterExecutor(executor.NewQoderExecutor(s.cfg))
+			return
+		}
 		s.coreManager.RegisterExecutor(executor.NewOpenAICompatExecutor(compatProviderKey, s.cfg))
 		return
 	}
@@ -424,6 +430,10 @@ func (s *Service) ensureExecutorsForAuthWithMode(a *coreauth.Auth, forceReplace 
 		s.coreManager.RegisterExecutor(executor.NewClaudeExecutor(s.cfg))
 	case "kimi":
 		s.coreManager.RegisterExecutor(executor.NewKimiExecutor(s.cfg))
+	case "qoder":
+		// Register the native Qoder executor when runtime auths are already tagged
+		// with provider=qoder instead of OpenAI-compatible attributes.
+		s.coreManager.RegisterExecutor(executor.NewQoderExecutor(s.cfg))
 	default:
 		providerKey := strings.ToLower(strings.TrimSpace(a.Provider))
 		if providerKey == "" {
@@ -843,7 +853,11 @@ func (s *Service) registerModelsForAuth(a *coreauth.Auth) {
 	provider := strings.ToLower(strings.TrimSpace(a.Provider))
 	compatProviderKey, compatDisplayName, compatDetected := openAICompatInfoFromAuth(a)
 	if compatDetected {
-		provider = "openai-compatibility"
+		if strings.EqualFold(compatProviderKey, "qoder") {
+			provider = "qoder"
+		} else {
+			provider = "openai-compatibility"
+		}
 	}
 	excluded := s.oauthExcludedModels(provider, authKind)
 	// The synthesizer pre-merges per-account and global exclusions into the "excluded_models" attribute.
@@ -927,6 +941,26 @@ func (s *Service) registerModelsForAuth(a *coreauth.Auth) {
 	case "kimi":
 		models = registry.GetKimiModels()
 		models = applyExcludedModels(models, excluded)
+	case "qoder":
+		if s.cfg != nil {
+			for i := range s.cfg.Qoder {
+				compat := &s.cfg.Qoder[i]
+				if compat.Disabled {
+					continue
+				}
+				if strings.EqualFold(compat.Name, compatDisplayName) || strings.TrimSpace(compatDisplayName) == "" {
+					ms := buildOpenAICompatRegistryModels(compat.Name, "qoder", compat.Models)
+					if len(ms) > 0 {
+						s.registerResolvedModelsForAuth(a, "qoder", applyModelPrefixes(ms, a.Prefix, s.cfg.ForceModelPrefix))
+					} else {
+						GlobalModelRegistry().UnregisterClient(a.ID)
+					}
+					return
+				}
+			}
+		}
+		GlobalModelRegistry().UnregisterClient(a.ID)
+		return
 	default:
 		// Handle OpenAI-compatibility providers by name using config
 		if s.cfg != nil {
@@ -973,30 +1007,7 @@ func (s *Service) registerModelsForAuth(a *coreauth.Auth) {
 				}
 				if strings.EqualFold(compat.Name, compatName) {
 					isCompatAuth = true
-					// Convert compatibility models to registry models
-					ms := make([]*ModelInfo, 0, len(compat.Models))
-					for j := range compat.Models {
-						m := compat.Models[j]
-						// Use alias as model ID, fallback to name if alias is empty
-						modelID := m.Alias
-						if modelID == "" {
-							modelID = m.Name
-						}
-						thinking := m.Thinking
-						if thinking == nil {
-							thinking = &registry.ThinkingSupport{Levels: []string{"low", "medium", "high"}}
-						}
-						ms = append(ms, &ModelInfo{
-							ID:          modelID,
-							Object:      "model",
-							Created:     time.Now().Unix(),
-							OwnedBy:     compat.Name,
-							Type:        "openai-compatibility",
-							DisplayName: modelID,
-							UserDefined: false,
-							Thinking:    thinking,
-						})
-					}
+					ms := buildOpenAICompatRegistryModels(compat.Name, "openai-compatibility", compat.Models)
 					// Register and return
 					if len(ms) > 0 {
 						if providerKey == "" {
@@ -1028,6 +1039,36 @@ func (s *Service) registerModelsForAuth(a *coreauth.Auth) {
 	}
 
 	GlobalModelRegistry().UnregisterClient(a.ID)
+}
+
+// buildOpenAICompatRegistryModels converts OpenAI-compatible model configs into registry entries.
+// It is shared by the OpenAI-compatible and Qoder bridge paths to keep model registration consistent.
+func buildOpenAICompatRegistryModels(owner string, modelType string, models []config.OpenAICompatibilityModel) []*ModelInfo {
+	ms := make([]*ModelInfo, 0, len(models))
+	now := time.Now().Unix()
+	for j := range models {
+		m := models[j]
+		// Use alias as model ID, fallback to name if alias is empty.
+		modelID := m.Alias
+		if modelID == "" {
+			modelID = m.Name
+		}
+		thinking := m.Thinking
+		if thinking == nil {
+			thinking = &registry.ThinkingSupport{Levels: []string{"low", "medium", "high"}}
+		}
+		ms = append(ms, &ModelInfo{
+			ID:          modelID,
+			Object:      "model",
+			Created:     now,
+			OwnedBy:     owner,
+			Type:        modelType,
+			DisplayName: modelID,
+			UserDefined: false,
+			Thinking:    thinking,
+		})
+	}
+	return ms
 }
 
 // refreshModelRegistrationForAuth re-applies the latest model registration for

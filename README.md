@@ -56,6 +56,7 @@ VisionCoder is also offering our users a limited-time <a href="https://coder.vis
 - Claude Code multi-account load balancing
 - OpenAI Codex multi-account load balancing
 - OpenAI-compatible upstream providers via config (e.g., OpenRouter)
+- Native Qoder PAT provider via `qoder` config
 - Reusable Go SDK for embedding the proxy (see `docs/sdk-usage.md`)
 
 ## Getting Started
