@@ -594,9 +594,10 @@ func (h *Handler) PutQoderCompat(c *gin.Context) {
 	filtered := make([]config.OpenAICompatibility, 0, len(arr))
 	for i := range arr {
 		normalizeOpenAICompatibilityEntry(&arr[i])
-		if strings.TrimSpace(arr[i].BaseURL) != "" {
-			filtered = append(filtered, arr[i])
-		}
+		// Qoder stores the native PAT in api-key-entries and does not require
+		// an upstream BaseURL. Keep normalized entries here and let the Qoder
+		// sanitizer drop only entries that have neither PAT nor BaseURL.
+		filtered = append(filtered, arr[i])
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
