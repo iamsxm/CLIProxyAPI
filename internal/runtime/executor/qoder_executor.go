@@ -27,6 +27,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
+	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -46,7 +47,7 @@ const (
 	qoderChatURL               = "https://api3.qoder.sh/algo/api/v2/service/pro/sse/agent_chat_generation?FetchKeys=llm_model_result&AgentId=agent_common&Encode=1"
 	qoderJobTokenPath          = "/algo/api/v3/user/jobToken?Encode=1"
 	qoderHeartbeatPath         = "/algo/api/v1/heartbeat?Encode=1"
-	qoderStreamIdleTimeout     = 3 * time.Second
+	qoderStreamIdleTimeout     = 120 * time.Second
 	qoderRequestTimeout        = 30 * time.Second
 	qoderControlRequestTimeout = 15 * time.Second
 )
@@ -100,6 +101,12 @@ func NewQoderExecutor(cfg *config.Config) *QoderExecutor {
 // Identifier implements cliproxyauth.ProviderExecutor.
 func (e *QoderExecutor) Identifier() string { return qoderProvider }
 
+// RequestToFormat tells the shared execution pipeline to translate inbound
+// Claude/Gemini/Responses payloads into OpenAI Chat shape before Qoder signing.
+func (e *QoderExecutor) RequestToFormat(cliproxyexecutor.Request, cliproxyexecutor.Options) sdktranslator.Format {
+	return sdktranslator.FormatOpenAI
+}
+
 // Execute converts the caller payload to a Qoder prompt, collects Qoder SSE deltas,
 // and returns a non-streaming response matching the caller's original protocol.
 func (e *QoderExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (resp cliproxyexecutor.Response, err error) {
@@ -110,22 +117,21 @@ func (e *QoderExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	reporter := helps.NewUsageReporter(ctx, e.Identifier(), baseModel, auth)
 	defer reporter.TrackFailure(ctx, &err)
 
-	payload := qoderOriginalPayload(req, opts)
-	prompt := qoderPromptFromPayload(payload, opts)
+	payload := qoderRequestPayload(req, opts)
+	prompt := qoderPromptForRequest(req, opts)
 	traceID := qoderShortID()
 	log.Infof("qoder request start trace=%s stream=false model=%s promptChars=%d", traceID, baseModel, len(prompt))
 
-	var text strings.Builder
+	completion := newQoderCompletion()
 	begin := time.Now()
-	if err = e.streamQoderText(ctx, auth, baseModel, prompt, traceID, func(delta string) {
-		text.WriteString(delta)
+	if err = e.streamQoderDeltas(ctx, auth, baseModel, prompt, payload, traceID, func(delta qoderDelta) {
+		completion.Add(delta)
 	}); err != nil {
 		return resp, err
 	}
-	output := text.String()
-	log.Infof("qoder request done trace=%s stream=false model=%s outputChars=%d costMs=%d", traceID, baseModel, len(output), time.Since(begin).Milliseconds())
+	log.Infof("qoder request done trace=%s stream=false model=%s outputChars=%d toolCalls=%d costMs=%d", traceID, baseModel, len(completion.Content), len(completion.ToolCalls), time.Since(begin).Milliseconds())
 	reporter.EnsurePublished(ctx)
-	return cliproxyexecutor.Response{Payload: qoderNonStreamResponse(opts.SourceFormat.String(), baseModel, output)}, nil
+	return cliproxyexecutor.Response{Payload: qoderNonStreamResponse(cliproxyexecutor.ResponseFormatOrSource(opts).String(), baseModel, completion)}, nil
 }
 
 // ExecuteStream converts Qoder deltas into the streaming envelope expected by
@@ -135,17 +141,17 @@ func (e *QoderExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	reporter := helps.NewUsageReporter(ctx, e.Identifier(), baseModel, auth)
 	defer reporter.TrackFailure(ctx, &err)
 
-	payload := qoderOriginalPayload(req, opts)
-	prompt := qoderPromptFromPayload(payload, opts)
+	payload := qoderRequestPayload(req, opts)
+	prompt := qoderPromptForRequest(req, opts)
 	traceID := qoderShortID()
 	log.Infof("qoder request start trace=%s stream=true format=%s model=%s promptChars=%d", traceID, opts.SourceFormat.String(), baseModel, len(prompt))
 
-	httpResp, err := e.openQoderStream(ctx, auth, baseModel, prompt, traceID)
+	httpResp, err := e.openQoderStream(ctx, auth, baseModel, prompt, payload, traceID)
 	if err != nil {
 		return nil, err
 	}
 	out := make(chan cliproxyexecutor.StreamChunk)
-	go e.forwardQoderStream(ctx, httpResp, out, opts.SourceFormat.String(), baseModel, traceID)
+	go e.forwardQoderStream(ctx, httpResp, out, cliproxyexecutor.ResponseFormatOrSource(opts).String(), baseModel, traceID)
 	return &cliproxyexecutor.StreamResult{Headers: httpResp.Header.Clone(), Chunks: out}, nil
 }
 
@@ -173,9 +179,10 @@ func (e *QoderExecutor) HttpRequest(context.Context, *cliproxyauth.Auth, *http.R
 	return nil, statusErr{code: http.StatusNotImplemented, msg: "qoder executor does not support generic HTTP passthrough"}
 }
 
-// streamQoderText opens the native Qoder SSE endpoint and emits extracted text deltas.
-func (e *QoderExecutor) streamQoderText(ctx context.Context, auth *cliproxyauth.Auth, model, prompt, traceID string, onText func(string)) error {
-	httpResp, err := e.openQoderStream(ctx, auth, model, prompt, traceID)
+// streamQoderDeltas opens the native Qoder SSE endpoint and emits structured
+// assistant deltas so reasoning and tool calls are not lost.
+func (e *QoderExecutor) streamQoderDeltas(ctx context.Context, auth *cliproxyauth.Auth, model, prompt string, payload []byte, traceID string, onDelta func(qoderDelta)) error {
+	httpResp, err := e.openQoderStream(ctx, auth, model, prompt, payload, traceID)
 	if err != nil {
 		return err
 	}
@@ -184,16 +191,26 @@ func (e *QoderExecutor) streamQoderText(ctx context.Context, auth *cliproxyauth.
 			log.Debugf("qoder close stream body trace=%s error=%v", traceID, closeErr)
 		}
 	}()
-	return consumeQoderTextStream(ctx, httpResp.Body, traceID, onText)
+	return consumeQoderDeltaStream(ctx, httpResp.Body, traceID, onDelta)
+}
+
+// streamQoderText preserves the old text-only helper for focused tests and
+// callers that only care about assistant content.
+func (e *QoderExecutor) streamQoderText(ctx context.Context, auth *cliproxyauth.Auth, model, prompt string, payload []byte, traceID string, onText func(string)) error {
+	return e.streamQoderDeltas(ctx, auth, model, prompt, payload, traceID, func(delta qoderDelta) {
+		if delta.Content != "" {
+			onText(delta.Content)
+		}
+	})
 }
 
 // openQoderStream builds the signed native Qoder request using the current bearer session.
-func (e *QoderExecutor) openQoderStream(ctx context.Context, auth *cliproxyauth.Auth, model, prompt, traceID string) (*http.Response, error) {
+func (e *QoderExecutor) openQoderStream(ctx context.Context, auth *cliproxyauth.Auth, model, prompt string, payload []byte, traceID string) (*http.Response, error) {
 	sess, err := e.getOrCreateSession(ctx, auth)
 	if err != nil {
 		return nil, err
 	}
-	body, modelSource, err := buildQoderBody(model, prompt, sess.identity.UserType)
+	body, modelSource, err := buildQoderBodyFromPayload(model, prompt, sess.identity.UserType, payload)
 	if err != nil {
 		return nil, err
 	}
@@ -270,9 +287,9 @@ func (e *QoderExecutor) forwardQoderStream(ctx context.Context, httpResp *http.R
 	}
 	chunks := 0
 	chars := 0
-	err := consumeQoderTextStream(ctx, httpResp.Body, traceID, func(delta string) {
+	err := consumeQoderDeltaStream(ctx, httpResp.Body, traceID, func(delta qoderDelta) {
 		chunks++
-		chars += len(delta)
+		chars += len(delta.Content)
 		for _, payload := range emitter.delta(delta) {
 			out <- cliproxyexecutor.StreamChunk{Payload: payload}
 		}
@@ -467,6 +484,250 @@ func buildQoderBody(model, prompt, userType string) ([]byte, string, error) {
 	return body, modelSource, nil
 }
 
+// buildQoderBodyFromPayload preserves qoder2api's structured message handling:
+// OpenAI-style messages/tools are forwarded to Qoder instead of flattening the
+// entire conversation into one user prompt.
+func buildQoderBodyFromPayload(model, prompt, userType string, payload []byte) ([]byte, string, error) {
+	body, modelSource, err := buildQoderBody(model, prompt, userType)
+	if err != nil {
+		return nil, "", err
+	}
+	if !gjson.ValidBytes(payload) || !gjson.GetBytes(payload, "messages").IsArray() {
+		return body, modelSource, nil
+	}
+	messages, err := qoderBuildMessagesFromPayload(body, payload, prompt)
+	if err != nil {
+		return nil, "", err
+	}
+	rawMessages, err := json.Marshal(messages)
+	if err != nil {
+		return nil, "", err
+	}
+	body, err = sjson.SetRawBytes(body, "messages", rawMessages)
+	if err != nil {
+		return nil, "", err
+	}
+	if tools := gjson.GetBytes(payload, "tools"); tools.IsArray() && len(tools.Array()) > 0 {
+		body, err = sjson.SetRawBytes(body, "tools", []byte(tools.Raw))
+		if err != nil {
+			return nil, "", err
+		}
+	}
+	return body, modelSource, nil
+}
+
+// qoderBuildMessagesFromPayload converts OpenAI Chat messages to the Qoder
+// message schema while keeping the embedded template system prompt when the
+// client did not provide its own system message.
+func qoderBuildMessagesFromPayload(templateBody, payload []byte, prompt string) ([]json.RawMessage, error) {
+	incoming := gjson.GetBytes(payload, "messages")
+	toolsEnabled := gjson.GetBytes(payload, "tools").IsArray() && len(gjson.GetBytes(payload, "tools").Array()) > 0
+	messages := make([]json.RawMessage, 0, len(incoming.Array())+4)
+	if !qoderMessagesHaveRole(incoming, "system") {
+		gjson.GetBytes(templateBody, "messages").ForEach(func(_, value gjson.Result) bool {
+			if strings.EqualFold(value.Get("role").String(), "system") {
+				messages = append(messages, json.RawMessage(value.Raw))
+			}
+			return true
+		})
+	}
+	incoming.ForEach(func(_, value gjson.Result) bool {
+		if converted := qoderConvertIncomingMessage(value, toolsEnabled); len(converted) > 0 {
+			messages = append(messages, converted)
+		}
+		return true
+	})
+	if len(messages) == 0 && strings.TrimSpace(prompt) != "" {
+		if msg, err := qoderUserMessageWithImages(prompt, nil); err == nil {
+			messages = append(messages, msg)
+		}
+	}
+	return messages, nil
+}
+
+func qoderMessagesHaveRole(messages gjson.Result, role string) bool {
+	found := false
+	if !messages.IsArray() {
+		return false
+	}
+	messages.ForEach(func(_, msg gjson.Result) bool {
+		if strings.EqualFold(msg.Get("role").String(), role) {
+			found = true
+			return false
+		}
+		return true
+	})
+	return found
+}
+
+func qoderConvertIncomingMessage(msg gjson.Result, toolsEnabled bool) json.RawMessage {
+	role := valueOrDefault(msg.Get("role").String(), "user")
+	text := qoderNormalizeMessageText(msg)
+	switch strings.ToLower(role) {
+	case "user":
+		if strings.TrimSpace(text) == "" && len(qoderExtractImageParts(msg)) == 0 {
+			return nil
+		}
+		raw, _ := qoderUserMessageWithImages(text, qoderExtractImageParts(msg))
+		return raw
+	case "assistant":
+		if toolCalls := msg.Get("tool_calls"); toolCalls.IsArray() && len(toolCalls.Array()) > 0 {
+			if toolsEnabled {
+				raw, _ := qoderStructuredMessage(role, text, map[string]any{"tool_calls": json.RawMessage(toolCalls.Raw)})
+				return raw
+			}
+			text = joinNonEmptySections(text, "Tool calls:\n"+toolCalls.Raw)
+		}
+		if toolsEnabled {
+			if parsed := qoderParseToolCallsText(text); len(parsed) > 0 {
+				raw, _ := qoderStructuredMessage(role, "", map[string]any{"tool_calls": qoderToolCallsForMessage(parsed)})
+				return raw
+			}
+		}
+		if strings.TrimSpace(text) == "" {
+			return nil
+		}
+		raw, _ := qoderStructuredMessage(role, text, nil)
+		return raw
+	case "tool":
+		if toolsEnabled {
+			extras := map[string]any{}
+			if name := msg.Get("name").String(); name != "" {
+				extras["name"] = name
+			}
+			if id := msg.Get("tool_call_id").String(); id != "" {
+				extras["tool_call_id"] = id
+			}
+			raw, _ := qoderStructuredMessage(role, text, extras)
+			return raw
+		}
+		raw, _ := qoderUserMessageWithImages(qoderRenderToolResult(msg, text), nil)
+		return raw
+	default:
+		if strings.TrimSpace(text) == "" {
+			return nil
+		}
+		raw, _ := qoderStructuredMessage(role, text, nil)
+		return raw
+	}
+}
+
+func qoderNormalizeMessageText(msg gjson.Result) string {
+	text := textFromContent(msg.Get("content"))
+	if strings.TrimSpace(text) == "" {
+		text = textFromContent(msg.Get("contents"))
+	}
+	return text
+}
+
+func qoderExtractImageParts(msg gjson.Result) []map[string]any {
+	content := msg.Get("content")
+	if !content.IsArray() {
+		return nil
+	}
+	parts := make([]map[string]any, 0)
+	content.ForEach(func(_, item gjson.Result) bool {
+		itemType := item.Get("type").String()
+		if itemType != "image_url" && itemType != "input_image" {
+			return true
+		}
+		imageURL := item.Get("image_url")
+		if imageURL.Type == gjson.String && imageURL.String() != "" {
+			parts = append(parts, map[string]any{"type": "image_url", "image_url": map[string]any{"url": imageURL.String()}})
+			return true
+		}
+		if imageURL.IsObject() && imageURL.Get("url").String() != "" {
+			var obj map[string]any
+			if err := json.Unmarshal([]byte(imageURL.Raw), &obj); err == nil {
+				parts = append(parts, map[string]any{"type": "image_url", "image_url": obj})
+			}
+			return true
+		}
+		if url := item.Get("url").String(); url != "" {
+			parts = append(parts, map[string]any{"type": "image_url", "image_url": map[string]any{"url": url}})
+		}
+		return true
+	})
+	return parts
+}
+
+func qoderUserMessageWithImages(text string, images []map[string]any) (json.RawMessage, error) {
+	contents := make([]map[string]any, 0, len(images)+1)
+	if text != "" {
+		contents = append(contents, map[string]any{"type": "text", "text": text})
+	}
+	contents = append(contents, images...)
+	if len(contents) == 0 {
+		contents = append(contents, map[string]any{"type": "text", "text": ""})
+	}
+	msg := map[string]any{
+		"role":                        "user",
+		"content":                     "",
+		"contents":                    contents,
+		"response_meta":               qoderBlankResponseMeta(),
+		"reasoning_content_signature": "",
+	}
+	raw, err := json.Marshal(msg)
+	return json.RawMessage(raw), err
+}
+
+func qoderStructuredMessage(role, text string, extras map[string]any) (json.RawMessage, error) {
+	msg := map[string]any{
+		"role":                        role,
+		"content":                     text,
+		"response_meta":               qoderBlankResponseMeta(),
+		"reasoning_content_signature": "",
+	}
+	for key, value := range extras {
+		msg[key] = value
+	}
+	raw, err := json.Marshal(msg)
+	return json.RawMessage(raw), err
+}
+
+func qoderBlankResponseMeta() map[string]any {
+	return map[string]any{
+		"id": "",
+		"usage": map[string]any{
+			"prompt_tokens":     0,
+			"completion_tokens": 0,
+			"total_tokens":      0,
+			"completion_tokens_details": map[string]any{
+				"reasoning_tokens": 0,
+			},
+			"prompt_tokens_details": map[string]any{
+				"cached_tokens": 0,
+			},
+		},
+	}
+}
+
+func qoderRenderToolResult(msg gjson.Result, text string) string {
+	label := "Tool result"
+	if name := msg.Get("name").String(); name != "" {
+		label += " (" + name + ")"
+	}
+	if id := msg.Get("tool_call_id").String(); id != "" {
+		label += " [" + id + "]"
+	}
+	if strings.TrimSpace(text) == "" {
+		return label
+	}
+	return label + ":\n" + text
+}
+
+func joinNonEmptySections(first, second string) string {
+	first = strings.TrimSpace(first)
+	second = strings.TrimSpace(second)
+	if first == "" {
+		return second
+	}
+	if second == "" {
+		return first
+	}
+	return first + "\n\n" + second
+}
+
 // qoderReplaceUserMessages keeps template system/tool messages and appends the current user prompt.
 func qoderReplaceUserMessages(body []byte, prompt string) ([]byte, error) {
 	var messages []json.RawMessage
@@ -514,9 +775,34 @@ func qoderUserMessage(prompt string) (json.RawMessage, error) {
 	return json.RawMessage(raw), err
 }
 
-// consumeQoderTextStream reads Qoder SSE lines, applies the same idle-stop behavior
-// as qoder2api, and passes decoded assistant text deltas to onText.
+type qoderToolCallDelta struct {
+	Index     int
+	ID        string
+	Type      string
+	Name      string
+	Arguments string
+}
+
+type qoderDelta struct {
+	Role      string
+	Content   string
+	Reasoning string
+	ToolCalls []qoderToolCallDelta
+}
+
+// consumeQoderTextStream reads Qoder SSE lines, applies the same idle-stop
+// behavior as qoder2api, and passes decoded assistant text deltas to onText.
 func consumeQoderTextStream(ctx context.Context, body io.Reader, traceID string, onText func(string)) error {
+	return consumeQoderDeltaStream(ctx, body, traceID, func(delta qoderDelta) {
+		if delta.Content != "" {
+			onText(delta.Content)
+		}
+	})
+}
+
+// consumeQoderDeltaStream reads Qoder SSE lines and passes structured deltas to
+// the caller. Qoder wraps OpenAI-compatible chunks inside body JSON strings.
+func consumeQoderDeltaStream(ctx context.Context, body io.Reader, traceID string, onDelta func(qoderDelta)) error {
 	lineCh := make(chan string)
 	errCh := make(chan error, 1)
 	go func() {
@@ -558,10 +844,13 @@ func consumeQoderTextStream(ctx context.Context, body io.Reader, traceID string,
 				continue
 			}
 			lines++
-			content := extractQoderContent(strings.TrimSpace(strings.TrimPrefix(line, "data:")))
-			if content != "" {
-				textChars += len(content)
-				onText(content)
+			delta, errDelta := extractQoderDelta(strings.TrimSpace(strings.TrimPrefix(line, "data:")))
+			if errDelta != nil {
+				return errDelta
+			}
+			if !delta.Empty() {
+				textChars += len(delta.Content)
+				onDelta(delta)
 			}
 		case <-idle.C:
 			log.Debugf("qoder stream complete trace=%s reason=idle_timeout lines=%d outputChars=%d", traceID, lines, textChars)
@@ -572,16 +861,188 @@ func consumeQoderTextStream(ctx context.Context, body io.Reader, traceID string,
 
 // extractQoderContent parses the native wrapper.body JSON and returns the first delta content.
 func extractQoderContent(dataLine string) string {
+	delta, _ := extractQoderDelta(dataLine)
+	return delta.Content
+}
+
+// extractQoderDelta parses a Qoder SSE data payload and surfaces quota-like
+// upstream errors so the auth scheduler can fail over to another PAT.
+func extractQoderDelta(dataLine string) (qoderDelta, error) {
 	inner := gjson.Get(dataLine, "body").String()
 	if inner == "" {
-		return ""
+		return qoderDelta{}, nil
 	}
-	var out string
+	if code, msg := gjson.Get(inner, "code").String(), gjson.Get(inner, "message").String(); code != "" && msg != "" && !gjson.Get(inner, "choices").Exists() {
+		if qoderIsQuotaExhaustedError(code) || qoderIsQuotaExhaustedError(msg) {
+			return qoderDelta{}, statusErr{code: http.StatusTooManyRequests, msg: "qoder quota exhausted: " + msg}
+		}
+		log.Warnf("qoder upstream error code=%s message=%s", code, msg)
+		return qoderDelta{}, nil
+	}
+	var out qoderDelta
 	gjson.Get(inner, "choices").ForEach(func(_, choice gjson.Result) bool {
-		out = choice.Get("delta.content").String()
-		return out == ""
+		choiceDelta := choice.Get("delta")
+		if role := choiceDelta.Get("role").String(); role != "" {
+			out.Role = role
+		}
+		if content := choiceDelta.Get("content"); content.Exists() && content.Type != gjson.Null {
+			out.Content += content.String()
+		}
+		if reasoning := qoderReasoningFromDelta(choiceDelta); reasoning != "" {
+			out.Reasoning += reasoning
+		}
+		if toolCalls := choiceDelta.Get("tool_calls"); toolCalls.IsArray() {
+			out.ToolCalls = append(out.ToolCalls, qoderParseToolCallDeltas(toolCalls)...)
+		}
+		return out.Empty()
+	})
+	return out, nil
+}
+
+func (d qoderDelta) Empty() bool {
+	return d.Role == "" && d.Content == "" && d.Reasoning == "" && len(d.ToolCalls) == 0
+}
+
+func qoderReasoningFromDelta(delta gjson.Result) string {
+	if reasoning := delta.Get("reasoning_content"); reasoning.Exists() && reasoning.Type != gjson.Null {
+		return reasoning.String()
+	}
+	if reasoning := delta.Get("reasoning"); reasoning.Exists() && reasoning.Type != gjson.Null {
+		return reasoning.String()
+	}
+	return ""
+}
+
+// qoderParseToolCallDeltas keeps the OpenAI stream shape that Qoder returns so
+// downstream clients receive function-call fragments in the same order.
+func qoderParseToolCallDeltas(toolCalls gjson.Result) []qoderToolCallDelta {
+	out := make([]qoderToolCallDelta, 0, len(toolCalls.Array()))
+	toolCalls.ForEach(func(_, tc gjson.Result) bool {
+		index := int(tc.Get("index").Int())
+		if !tc.Get("index").Exists() {
+			index = len(out)
+		}
+		callType := valueOrDefault(tc.Get("type").String(), "function")
+		out = append(out, qoderToolCallDelta{
+			Index:     index,
+			ID:        tc.Get("id").String(),
+			Type:      callType,
+			Name:      tc.Get("function.name").String(),
+			Arguments: tc.Get("function.arguments").String(),
+		})
+		return true
 	})
 	return out
+}
+
+type qoderToolCall struct {
+	Index     int
+	ID        string
+	Type      string
+	Name      string
+	Arguments string
+}
+
+type qoderToolCallAccumulator struct {
+	order []int
+	calls map[int]*qoderToolCall
+}
+
+func newQoderToolCallAccumulator() *qoderToolCallAccumulator {
+	return &qoderToolCallAccumulator{calls: map[int]*qoderToolCall{}}
+}
+
+// Add merges OpenAI-compatible streaming tool call fragments by index. Qoder
+// can split id/name and arguments across multiple SSE chunks.
+func (a *qoderToolCallAccumulator) Add(delta qoderToolCallDelta) {
+	if a == nil {
+		return
+	}
+	call := a.calls[delta.Index]
+	if call == nil {
+		call = &qoderToolCall{Index: delta.Index, Type: "function"}
+		a.calls[delta.Index] = call
+		a.order = append(a.order, delta.Index)
+	}
+	if delta.ID != "" {
+		call.ID = delta.ID
+	}
+	if delta.Type != "" {
+		call.Type = delta.Type
+	}
+	if delta.Name != "" {
+		call.Name = delta.Name
+	}
+	if delta.Arguments != "" {
+		call.Arguments += delta.Arguments
+	}
+}
+
+func (a *qoderToolCallAccumulator) Final() []qoderToolCall {
+	if a == nil || len(a.order) == 0 {
+		return nil
+	}
+	out := make([]qoderToolCall, 0, len(a.order))
+	for _, index := range a.order {
+		call := a.calls[index]
+		if call == nil {
+			continue
+		}
+		if call.ID == "" && call.Name == "" && call.Arguments == "" {
+			continue
+		}
+		if call.ID == "" {
+			call.ID = fmt.Sprintf("call_%d", index)
+		}
+		if call.Type == "" {
+			call.Type = "function"
+		}
+		out = append(out, *call)
+	}
+	return out
+}
+
+type qoderCompletion struct {
+	Content   string
+	Reasoning string
+	ToolCalls []qoderToolCall
+	tools     *qoderToolCallAccumulator
+}
+
+func newQoderCompletion() *qoderCompletion {
+	return &qoderCompletion{tools: newQoderToolCallAccumulator()}
+}
+
+// Add accumulates a Qoder delta into a complete assistant message, preserving
+// text, reasoning text, and function-call fragments.
+func (c *qoderCompletion) Add(delta qoderDelta) {
+	if c == nil {
+		return
+	}
+	c.Content += delta.Content
+	c.Reasoning += delta.Reasoning
+	for _, toolCall := range delta.ToolCalls {
+		c.tools.Add(toolCall)
+	}
+	c.ToolCalls = c.tools.Final()
+}
+
+func qoderIsQuotaExhaustedError(message string) bool {
+	msg := strings.ToLower(strings.TrimSpace(message))
+	if msg == "" {
+		return false
+	}
+	return strings.Contains(msg, "quota") ||
+		strings.Contains(msg, "exhausted") ||
+		strings.Contains(msg, "limit exceeded") ||
+		strings.Contains(msg, "daily limit") ||
+		strings.Contains(msg, "daily_limit") ||
+		strings.Contains(msg, "rate limit") ||
+		strings.Contains(msg, "rate_limit") ||
+		strings.Contains(msg, "too many") ||
+		strings.Contains(msg, "insufficient") ||
+		strings.Contains(msg, "429") ||
+		(strings.Contains(msg, "403") && (strings.Contains(msg, "balance") || strings.Contains(msg, "credit")))
 }
 
 // qoderOriginalPayload prefers the inbound raw request so prompt extraction sees
@@ -591,6 +1052,40 @@ func qoderOriginalPayload(req cliproxyexecutor.Request, opts cliproxyexecutor.Op
 		return opts.OriginalRequest
 	}
 	return req.Payload
+}
+
+// qoderRequestPayload prefers the framework-translated OpenAI Chat payload for
+// Qoder body construction, with the original request as a compatibility fallback.
+func qoderRequestPayload(req cliproxyexecutor.Request, opts cliproxyexecutor.Options) []byte {
+	if gjson.ValidBytes(req.Payload) && gjson.GetBytes(req.Payload, "messages").IsArray() {
+		return req.Payload
+	}
+	return qoderOriginalPayload(req, opts)
+}
+
+// qoderPromptForRequest mirrors qoder2api: chat_context text is the latest user
+// prompt, while the full multi-turn conversation is carried in messages[].
+func qoderPromptForRequest(req cliproxyexecutor.Request, opts cliproxyexecutor.Options) string {
+	if prompt := qoderLatestUserPrompt(qoderRequestPayload(req, opts)); strings.TrimSpace(prompt) != "" {
+		return prompt
+	}
+	return qoderPromptFromPayload(qoderOriginalPayload(req, opts), opts)
+}
+
+func qoderLatestUserPrompt(payload []byte) string {
+	messages := gjson.GetBytes(payload, "messages")
+	if !messages.IsArray() {
+		return ""
+	}
+	arr := messages.Array()
+	for i := len(arr) - 1; i >= 0; i-- {
+		if strings.EqualFold(arr[i].Get("role").String(), "user") {
+			if text := qoderNormalizeMessageText(arr[i]); strings.TrimSpace(text) != "" {
+				return text
+			}
+		}
+	}
+	return ""
 }
 
 // qoderPromptFromPayload converts supported client schemas into Qoder's plain transcript.
@@ -924,6 +1419,10 @@ func qoderNormalizeModel(model string) string {
 	if base == "" {
 		return qoderDefaultModel
 	}
+	switch base {
+	case "Qwen3.7-Max":
+		return "qmodel_latest"
+	}
 	return base
 }
 
@@ -943,14 +1442,47 @@ func mustJSONText(v any) string {
 	return string(b)
 }
 
-func qoderNonStreamResponse(format, model, text string) []byte {
+func qoderNonStreamResponse(format, model string, completion *qoderCompletion) []byte {
+	completion = qoderPrepareCompletionForResponse(completion)
 	switch strings.ToLower(strings.TrimSpace(format)) {
 	case "openai-response":
-		return mustJSON(qoderResponseCompleted("resp_"+qoderShortID(), time.Now().Unix(), model, text))
+		return mustJSON(qoderResponseCompleted("resp_"+qoderShortID(), time.Now().Unix(), model, completion))
 	case "claude":
-		return mustJSON(qoderAnthropicMessage("msg_"+qoderShortID(), model, text))
+		return mustJSON(qoderAnthropicMessage("msg_"+qoderShortID(), model, completion))
 	default:
-		return mustJSON(qoderChatCompletion("chatcmpl_"+qoderShortID(), time.Now().Unix(), model, text))
+		return mustJSON(qoderChatCompletion("chatcmpl_"+qoderShortID(), time.Now().Unix(), model, completion))
+	}
+}
+
+func qoderTextCompletion(text string) *qoderCompletion {
+	completion := newQoderCompletion()
+	completion.Content = text
+	return completion
+}
+
+func qoderEnsureCompletion(completion *qoderCompletion) *qoderCompletion {
+	if completion == nil {
+		return newQoderCompletion()
+	}
+	return completion
+}
+
+// qoderPrepareCompletionForResponse mirrors qoder2api's textual tool-call
+// fallback: "Tool calls: [...]" is converted back to structured function calls.
+func qoderPrepareCompletionForResponse(completion *qoderCompletion) *qoderCompletion {
+	completion = qoderEnsureCompletion(completion)
+	if len(completion.ToolCalls) > 0 {
+		return completion
+	}
+	parsed := qoderParseToolCallsText(completion.Content)
+	if len(parsed) == 0 {
+		return completion
+	}
+	return &qoderCompletion{
+		Content:   "",
+		Reasoning: completion.Reasoning,
+		ToolCalls: parsed,
+		tools:     completion.tools,
 	}
 }
 
@@ -971,22 +1503,118 @@ func qoderZeroAnthropicUsage() map[string]any {
 	return map[string]any{"input_tokens": 0, "output_tokens": 0}
 }
 
-func qoderChatCompletion(id string, created int64, model, text string) map[string]any {
+func qoderChatCompletion(id string, created int64, model string, completion *qoderCompletion) map[string]any {
+	completion = qoderEnsureCompletion(completion)
+	message := map[string]any{
+		"role":    "assistant",
+		"content": completion.Content,
+	}
+	if completion.Reasoning != "" {
+		message["reasoning_content"] = completion.Reasoning
+	}
+	if len(completion.ToolCalls) > 0 {
+		message["tool_calls"] = qoderOpenAIToolCalls(completion.ToolCalls)
+	}
+	finishReason := "stop"
+	if len(completion.ToolCalls) > 0 {
+		finishReason = "tool_calls"
+	}
 	return map[string]any{
 		"id":      id,
 		"object":  "chat.completion",
 		"created": created,
 		"model":   model,
 		"choices": []map[string]any{{
-			"index": 0,
-			"message": map[string]any{
-				"role":    "assistant",
-				"content": text,
-			},
-			"finish_reason": "stop",
+			"index":         0,
+			"message":       message,
+			"finish_reason": finishReason,
 		}},
 		"usage": qoderZeroOpenAIUsage(),
 	}
+}
+
+func qoderOpenAIToolCalls(toolCalls []qoderToolCall) []map[string]any {
+	out := make([]map[string]any, 0, len(toolCalls))
+	for i, call := range toolCalls {
+		index := call.Index
+		if index < 0 {
+			index = i
+		}
+		out = append(out, map[string]any{
+			"index": index,
+			"id":    valueOrDefault(call.ID, fmt.Sprintf("call_%d", index)),
+			"type":  valueOrDefault(call.Type, "function"),
+			"function": map[string]any{
+				"name":      call.Name,
+				"arguments": call.Arguments,
+			},
+		})
+	}
+	return out
+}
+
+func qoderToolCallsForMessage(toolCalls []qoderToolCall) []map[string]any {
+	out := make([]map[string]any, 0, len(toolCalls))
+	for _, call := range toolCalls {
+		out = append(out, map[string]any{
+			"id":   call.ID,
+			"type": valueOrDefault(call.Type, "function"),
+			"function": map[string]any{
+				"name":      call.Name,
+				"arguments": call.Arguments,
+			},
+		})
+	}
+	return out
+}
+
+// qoderParseToolCallsText parses qoder2api-compatible assistant text fallback:
+// Tool calls: followed by a JSON array, optionally wrapped in a fenced block.
+func qoderParseToolCallsText(text string) []qoderToolCall {
+	trimmed := strings.TrimSpace(text)
+	if !strings.HasPrefix(trimmed, "Tool calls:") {
+		return nil
+	}
+	payload := strings.TrimSpace(strings.TrimPrefix(trimmed, "Tool calls:"))
+	if strings.HasPrefix(payload, "```") && strings.HasSuffix(payload, "```") {
+		if newline := strings.Index(payload, "\n"); newline >= 0 {
+			payload = strings.TrimSpace(payload[newline : len(payload)-3])
+		}
+	}
+	if !strings.HasPrefix(payload, "[") || !gjson.Valid(payload) {
+		return nil
+	}
+	raw := gjson.Parse(payload)
+	if !raw.IsArray() {
+		return nil
+	}
+	out := make([]qoderToolCall, 0, len(raw.Array()))
+	raw.ForEach(func(_, item gjson.Result) bool {
+		name := item.Get("function.name").String()
+		args := qoderNormalizeToolArguments(item.Get("function.arguments"))
+		if name == "" && args == "" {
+			return true
+		}
+		out = append(out, qoderToolCall{
+			Index:     len(out),
+			ID:        item.Get("id").String(),
+			Type:      valueOrDefault(item.Get("type").String(), "function"),
+			Name:      name,
+			Arguments: args,
+		})
+		return true
+	})
+	return out
+}
+
+func qoderNormalizeToolArguments(arguments gjson.Result) string {
+	if !arguments.Exists() || arguments.Type == gjson.Null {
+		return ""
+	}
+	if arguments.Type == gjson.String {
+		return arguments.String()
+	}
+	return arguments.Raw
 }
 
 func qoderChatChunk(id string, created int64, model, content string, done bool) []byte {
@@ -1005,11 +1633,112 @@ func qoderChatChunk(id string, created int64, model, content string, done bool) 
 	})
 }
 
+func qoderChatDeltaChunk(id string, created int64, model string, delta qoderDelta, done bool) []byte {
+	choice := map[string]any{"index": 0, "delta": map[string]any{}, "finish_reason": nil}
+	if done {
+		choice["finish_reason"] = "stop"
+	} else {
+		payload := map[string]any{"role": "assistant"}
+		if delta.Content != "" {
+			payload["content"] = delta.Content
+		}
+		if delta.Reasoning != "" {
+			payload["reasoning_content"] = delta.Reasoning
+		}
+		if len(delta.ToolCalls) > 0 {
+			payload["tool_calls"] = qoderOpenAIToolCallDeltas(delta.ToolCalls)
+		}
+		choice["delta"] = payload
+	}
+	return mustJSON(map[string]any{
+		"id":      id,
+		"object":  "chat.completion.chunk",
+		"created": created,
+		"model":   model,
+		"choices": []map[string]any{choice},
+	})
+}
+
+func qoderChatDoneChunk(id string, created int64, model string, toolCalls bool) []byte {
+	finishReason := "stop"
+	if toolCalls {
+		finishReason = "tool_calls"
+	}
+	return mustJSON(map[string]any{
+		"id":      id,
+		"object":  "chat.completion.chunk",
+		"created": created,
+		"model":   model,
+		"choices": []map[string]any{{
+			"index":         0,
+			"delta":         map[string]any{},
+			"finish_reason": finishReason,
+		}},
+	})
+}
+
+func qoderOpenAIToolCallDeltas(toolCalls []qoderToolCallDelta) []map[string]any {
+	out := make([]map[string]any, 0, len(toolCalls))
+	for _, call := range toolCalls {
+		item := map[string]any{
+			"index": call.Index,
+			"type":  valueOrDefault(call.Type, "function"),
+			"function": map[string]any{
+				"arguments": call.Arguments,
+			},
+		}
+		if call.ID != "" {
+			item["id"] = call.ID
+		}
+		if call.Name != "" {
+			item["function"].(map[string]any)["name"] = call.Name
+		}
+		out = append(out, item)
+	}
+	return out
+}
+
 func qoderResponseStart(id string, created int64, model string) map[string]any {
 	return map[string]any{"id": id, "object": "response", "created_at": created, "status": "in_progress", "model": model, "output": []any{}, "usage": qoderZeroResponsesUsage()}
 }
 
-func qoderResponseCompleted(id string, created int64, model, text string) map[string]any {
+func qoderResponseCompleted(id string, created int64, model string, completion *qoderCompletion) map[string]any {
+	completion = qoderEnsureCompletion(completion)
+	output := make([]map[string]any, 0, 1+len(completion.ToolCalls))
+	if completion.Reasoning != "" {
+		output = append(output, map[string]any{
+			"id":     "rs_" + qoderShortID(),
+			"type":   "reasoning",
+			"status": "completed",
+			"summary": []map[string]any{{
+				"type": "summary_text",
+				"text": completion.Reasoning,
+			}},
+		})
+	}
+	if completion.Content != "" || len(output) == 0 && len(completion.ToolCalls) == 0 {
+		output = append(output, map[string]any{
+			"id":     "msg_" + qoderShortID(),
+			"type":   "message",
+			"status": "completed",
+			"role":   "assistant",
+			"content": []map[string]any{{
+				"type":        "output_text",
+				"text":        completion.Content,
+				"annotations": []any{},
+			}},
+		})
+	}
+	for _, call := range completion.ToolCalls {
+		output = append(output, map[string]any{
+			"id":        "fc_" + valueOrDefault(call.ID, qoderShortID()),
+			"type":      "function_call",
+			"status":    "completed",
+			"arguments": call.Arguments,
+			"call_id":   valueOrDefault(call.ID, fmt.Sprintf("call_%d", call.Index)),
+			"name":      call.Name,
+		})
+	}
 	return map[string]any{
 		"id":           id,
 		"object":       "response",
@@ -1017,43 +1746,79 @@ func qoderResponseCompleted(id string, created int64, model, text string) map[st
 		"status":       "completed",
 		"completed_at": created,
 		"model":        model,
-		"output": []map[string]any{{
-			"id":     "msg_" + qoderShortID(),
-			"type":   "message",
-			"status": "completed",
-			"role":   "assistant",
-			"content": []map[string]any{{
-				"type":        "output_text",
-				"text":        text,
-				"annotations": []any{},
-			}},
-		}},
-		"usage": qoderZeroResponsesUsage(),
+		"output":       output,
+		"usage":        qoderZeroResponsesUsage(),
 	}
 }
 
-func qoderAnthropicMessage(id, model, text string) map[string]any {
+func qoderAnthropicMessage(id, model string, completion *qoderCompletion) map[string]any {
+	completion = qoderEnsureCompletion(completion)
+	content := make([]map[string]any, 0, 1+len(completion.ToolCalls))
+	if completion.Reasoning != "" {
+		content = append(content, map[string]any{"type": "thinking", "thinking": completion.Reasoning})
+	}
+	if completion.Content != "" || len(content) == 0 && len(completion.ToolCalls) == 0 {
+		content = append(content, map[string]any{"type": "text", "text": completion.Content})
+	}
+	for _, call := range completion.ToolCalls {
+		content = append(content, map[string]any{
+			"type":  "tool_use",
+			"id":    valueOrDefault(call.ID, fmt.Sprintf("call_%d", call.Index)),
+			"name":  call.Name,
+			"input": qoderToolInput(call.Arguments),
+		})
+	}
+	stopReason := "end_turn"
+	if len(completion.ToolCalls) > 0 {
+		stopReason = "tool_use"
+	}
 	return map[string]any{
 		"id":            id,
 		"type":          "message",
 		"role":          "assistant",
 		"model":         model,
-		"content":       []map[string]any{{"type": "text", "text": text}},
-		"stop_reason":   "end_turn",
+		"content":       content,
+		"stop_reason":   stopReason,
 		"stop_sequence": nil,
 		"usage":         qoderZeroAnthropicUsage(),
 	}
 }
 
+func qoderToolInput(arguments string) any {
+	trimmed := strings.TrimSpace(arguments)
+	if trimmed == "" {
+		return map[string]any{}
+	}
+	var obj map[string]any
+	if err := json.Unmarshal([]byte(trimmed), &obj); err == nil {
+		return obj
+	}
+	var value any
+	if err := json.Unmarshal([]byte(trimmed), &value); err == nil {
+		return map[string]any{"arguments": value}
+	}
+	return map[string]any{"arguments": arguments}
+}
+
 type qoderStreamEmitter struct {
-	format   string
-	model    string
-	id       string
-	created  int64
-	itemID   string
-	partID   string
-	seq      int
-	fullText strings.Builder
+	format         string
+	model          string
+	id             string
+	created        int64
+	itemID         string
+	partID         string
+	reasoningID    string
+	seq            int
+	fullText       strings.Builder
+	fullReasoning  strings.Builder
+	tools          *qoderToolCallAccumulator
+	toolItemAdded  map[int]bool
+	toolItemDone   map[int]bool
+	toolOutputIdx  map[int]int
+	toolBlockIndex map[int]int
+	claudeIndex    int
+	claudeOpen     string
+	seenToolCalls  bool
 }
 
 func newQoderStreamEmitter(format, model string) *qoderStreamEmitter {
@@ -1064,13 +1829,18 @@ func newQoderStreamEmitter(format, model string) *qoderStreamEmitter {
 		prefix = "msg_"
 	}
 	return &qoderStreamEmitter{
-		format:  format,
-		model:   model,
-		id:      prefix + qoderShortID(),
-		created: time.Now().Unix(),
-		itemID:  "msg_" + qoderShortID(),
-		partID:  "part_" + qoderShortID(),
-		seq:     1,
+		format:         format,
+		model:          model,
+		id:             prefix + qoderShortID(),
+		created:        time.Now().Unix(),
+		itemID:         "msg_" + qoderShortID(),
+		partID:         "part_" + qoderShortID(),
+		tools:          newQoderToolCallAccumulator(),
+		toolItemAdded:  map[int]bool{},
+		toolItemDone:   map[int]bool{},
+		toolOutputIdx:  map[int]int{},
+		toolBlockIndex: map[int]int{},
+		seq:            1,
 	}
 }
 
@@ -1084,46 +1854,230 @@ func (e *qoderStreamEmitter) start() [][]byte {
 		}
 	case "claude":
 		return [][]byte{
-			qoderAnthropicEvent("message_start", map[string]any{"type": "message_start", "message": qoderAnthropicMessage(e.id, e.model, "")}),
-			qoderAnthropicEvent("content_block_start", map[string]any{"type": "content_block_start", "index": 0, "content_block": map[string]any{"type": "text", "text": ""}}),
+			qoderAnthropicEvent("message_start", map[string]any{"type": "message_start", "message": qoderAnthropicMessage(e.id, e.model, qoderTextCompletion(""))}),
 		}
 	default:
 		return nil
 	}
 }
 
-func (e *qoderStreamEmitter) delta(delta string) [][]byte {
-	e.fullText.WriteString(delta)
+func (e *qoderStreamEmitter) delta(delta qoderDelta) [][]byte {
+	e.fullText.WriteString(delta.Content)
+	e.fullReasoning.WriteString(delta.Reasoning)
+	for _, toolCall := range delta.ToolCalls {
+		e.seenToolCalls = true
+		e.tools.Add(toolCall)
+	}
 	switch e.format {
 	case "openai-response":
-		return [][]byte{qoderResponsesData(e.responseEvent("response.output_text.delta", map[string]any{"response_id": e.id, "item_id": e.itemID, "output_index": 0, "content_index": 0, "delta": delta}))}
+		return e.responsesDelta(delta)
 	case "claude":
-		return [][]byte{qoderAnthropicEvent("content_block_delta", map[string]any{"type": "content_block_delta", "index": 0, "delta": map[string]any{"type": "text_delta", "text": delta}})}
+		return e.claudeDelta(delta)
 	default:
-		return [][]byte{qoderChatChunk(e.id, e.created, e.model, delta, false)}
+		return [][]byte{qoderChatDeltaChunk(e.id, e.created, e.model, delta, false)}
 	}
 }
 
 func (e *qoderStreamEmitter) done() [][]byte {
 	text := e.fullText.String()
+	completion := newQoderCompletion()
+	completion.Content = text
+	completion.Reasoning = e.fullReasoning.String()
+	completion.ToolCalls = e.tools.Final()
 	switch e.format {
 	case "openai-response":
-		return [][]byte{
+		out := [][]byte{
 			qoderResponsesData(e.responseEvent("response.output_text.done", map[string]any{"response_id": e.id, "item_id": e.itemID, "output_index": 0, "content_index": 0, "delta": "", "text": text})),
 			qoderResponsesData(e.responseEvent("response.content_part.done", map[string]any{"response_id": e.id, "item_id": e.itemID, "output_index": 0, "content_index": 0, "part": map[string]any{"id": e.partID, "type": "output_text", "text": text, "annotations": []any{}}})),
 			qoderResponsesData(e.responseEvent("response.output_item.done", map[string]any{"output_index": 0, "item": map[string]any{"id": e.itemID, "type": "message", "status": "completed", "role": "assistant", "content": []map[string]any{{"type": "output_text", "text": text, "annotations": []any{}}}}})),
-			qoderResponsesData(e.responseStateEvent("response.completed", qoderResponseCompleted(e.id, e.created, e.model, text))),
+		}
+		out = append(out, e.responsesDone(completion)...)
+		out = append(out,
+			qoderResponsesData(e.responseStateEvent("response.completed", qoderResponseCompleted(e.id, e.created, e.model, completion))),
 			[]byte("data: [DONE]\n\n"),
-		}
+		)
+		return out
 	case "claude":
-		return [][]byte{
-			qoderAnthropicEvent("content_block_stop", map[string]any{"type": "content_block_stop", "index": 0, "content_block": map[string]any{"type": "text", "text": text, "annotations": []any{}}}),
-			qoderAnthropicEvent("message_delta", map[string]any{"type": "message_delta", "delta": map[string]any{"stop_reason": "end_turn", "stop_sequence": nil}, "usage": map[string]any{"output_tokens": 0}}),
-			qoderAnthropicEvent("message_stop", map[string]any{"type": "message_stop"}),
+		out := e.claudeCloseOpenBlock()
+		out = append(out, e.claudeToolDone(completion.ToolCalls)...)
+		stopReason := "end_turn"
+		if len(completion.ToolCalls) > 0 {
+			stopReason = "tool_use"
 		}
+		out = append(out,
+			qoderAnthropicEvent("message_delta", map[string]any{"type": "message_delta", "delta": map[string]any{"stop_reason": stopReason, "stop_sequence": nil}, "usage": map[string]any{"output_tokens": 0}}),
+			qoderAnthropicEvent("message_stop", map[string]any{"type": "message_stop"}),
+		)
+		return out
 	default:
-		return [][]byte{qoderChatChunk(e.id, e.created, e.model, "", true)}
+		return [][]byte{qoderChatDoneChunk(e.id, e.created, e.model, e.seenToolCalls)}
 	}
+}
+
+func (e *qoderStreamEmitter) responsesDelta(delta qoderDelta) [][]byte {
+	out := make([][]byte, 0, 2+len(delta.ToolCalls)*2)
+	if delta.Content != "" {
+		out = append(out, qoderResponsesData(e.responseEvent("response.output_text.delta", map[string]any{
+			"response_id":   e.id,
+			"item_id":       e.itemID,
+			"output_index":  0,
+			"content_index": 0,
+			"delta":         delta.Content,
+		})))
+	}
+	if delta.Reasoning != "" {
+		out = append(out, e.responsesReasoningDelta(delta.Reasoning)...)
+	}
+	for _, toolCall := range delta.ToolCalls {
+		out = append(out, e.responsesToolDelta(toolCall)...)
+	}
+	return out
+}
+
+func (e *qoderStreamEmitter) responsesReasoningDelta(text string) [][]byte {
+	out := make([][]byte, 0, 3)
+	if e.reasoningID == "" {
+		e.reasoningID = "rs_" + qoderShortID()
+		out = append(out,
+			qoderResponsesData(e.responseEvent("response.output_item.added", map[string]any{"output_index": 1, "item": map[string]any{"id": e.reasoningID, "type": "reasoning", "status": "in_progress", "summary": []any{}}})),
+			qoderResponsesData(e.responseEvent("response.reasoning_summary_part.added", map[string]any{"item_id": e.reasoningID, "output_index": 1, "summary_index": 0, "part": map[string]any{"type": "summary_text", "text": ""}})),
+		)
+	}
+	out = append(out, qoderResponsesData(e.responseEvent("response.reasoning_summary_text.delta", map[string]any{
+		"item_id":       e.reasoningID,
+		"output_index":  1,
+		"summary_index": 0,
+		"delta":         text,
+	})))
+	return out
+}
+
+func (e *qoderStreamEmitter) responsesToolDelta(delta qoderToolCallDelta) [][]byte {
+	out := make([][]byte, 0, 2)
+	call := e.tools.calls[delta.Index]
+	if call == nil {
+		return out
+	}
+	if !e.toolItemAdded[delta.Index] {
+		outputIndex := 2 + len(e.toolItemAdded)
+		e.toolOutputIdx[delta.Index] = outputIndex
+		e.toolItemAdded[delta.Index] = true
+		out = append(out, qoderResponsesData(e.responseEvent("response.output_item.added", map[string]any{
+			"output_index": outputIndex,
+			"item": map[string]any{
+				"id":        "fc_" + valueOrDefault(call.ID, fmt.Sprintf("call_%d", delta.Index)),
+				"type":      "function_call",
+				"status":    "in_progress",
+				"arguments": "",
+				"call_id":   valueOrDefault(call.ID, fmt.Sprintf("call_%d", delta.Index)),
+				"name":      call.Name,
+			},
+		})))
+	}
+	if delta.Arguments != "" {
+		callID := valueOrDefault(call.ID, fmt.Sprintf("call_%d", delta.Index))
+		out = append(out, qoderResponsesData(e.responseEvent("response.function_call_arguments.delta", map[string]any{
+			"item_id":      "fc_" + callID,
+			"output_index": e.toolOutputIdx[delta.Index],
+			"delta":        delta.Arguments,
+		})))
+	}
+	return out
+}
+
+func (e *qoderStreamEmitter) responsesDone(completion *qoderCompletion) [][]byte {
+	out := make([][]byte, 0, 2+len(completion.ToolCalls)*2)
+	if e.reasoningID != "" {
+		reasoning := completion.Reasoning
+		out = append(out,
+			qoderResponsesData(e.responseEvent("response.reasoning_summary_text.done", map[string]any{"item_id": e.reasoningID, "output_index": 1, "summary_index": 0, "text": reasoning})),
+			qoderResponsesData(e.responseEvent("response.reasoning_summary_part.done", map[string]any{"item_id": e.reasoningID, "output_index": 1, "summary_index": 0, "part": map[string]any{"type": "summary_text", "text": reasoning}})),
+			qoderResponsesData(e.responseEvent("response.output_item.done", map[string]any{"output_index": 1, "item": map[string]any{"id": e.reasoningID, "type": "reasoning", "status": "completed", "summary": []map[string]any{{"type": "summary_text", "text": reasoning}}}})),
+		)
+	}
+	for _, call := range completion.ToolCalls {
+		out = append(out, e.responsesToolDone(call)...)
+	}
+	return out
+}
+
+func (e *qoderStreamEmitter) responsesToolDone(call qoderToolCall) [][]byte {
+	if e.toolItemDone[call.Index] {
+		return nil
+	}
+	out := make([][]byte, 0, 3)
+	if !e.toolItemAdded[call.Index] {
+		out = append(out, e.responsesToolDelta(qoderToolCallDelta{Index: call.Index, ID: call.ID, Type: call.Type, Name: call.Name})...)
+	}
+	callID := valueOrDefault(call.ID, fmt.Sprintf("call_%d", call.Index))
+	outputIndex := e.toolOutputIdx[call.Index]
+	e.toolItemDone[call.Index] = true
+	out = append(out,
+		qoderResponsesData(e.responseEvent("response.function_call_arguments.done", map[string]any{"item_id": "fc_" + callID, "output_index": outputIndex, "arguments": call.Arguments})),
+		qoderResponsesData(e.responseEvent("response.output_item.done", map[string]any{"output_index": outputIndex, "item": map[string]any{
+			"id":        "fc_" + callID,
+			"type":      "function_call",
+			"status":    "completed",
+			"arguments": call.Arguments,
+			"call_id":   callID,
+			"name":      call.Name,
+		}})),
+	)
+	return out
+}
+
+func (e *qoderStreamEmitter) claudeDelta(delta qoderDelta) [][]byte {
+	out := make([][]byte, 0, 2)
+	if delta.Reasoning != "" {
+		out = append(out, e.claudeEnsureBlock("thinking")...)
+		out = append(out, qoderAnthropicEvent("content_block_delta", map[string]any{"type": "content_block_delta", "index": e.claudeIndex, "delta": map[string]any{"type": "thinking_delta", "thinking": delta.Reasoning}}))
+	}
+	if delta.Content != "" {
+		out = append(out, e.claudeEnsureBlock("text")...)
+		out = append(out, qoderAnthropicEvent("content_block_delta", map[string]any{"type": "content_block_delta", "index": e.claudeIndex, "delta": map[string]any{"type": "text_delta", "text": delta.Content}}))
+	}
+	return out
+}
+
+func (e *qoderStreamEmitter) claudeEnsureBlock(kind string) [][]byte {
+	if e.claudeOpen == kind {
+		return nil
+	}
+	out := e.claudeCloseOpenBlock()
+	e.claudeOpen = kind
+	contentBlock := map[string]any{"type": kind}
+	if kind == "thinking" {
+		contentBlock["thinking"] = ""
+	} else {
+		contentBlock["text"] = ""
+	}
+	out = append(out, qoderAnthropicEvent("content_block_start", map[string]any{"type": "content_block_start", "index": e.claudeIndex, "content_block": contentBlock}))
+	return out
+}
+
+func (e *qoderStreamEmitter) claudeCloseOpenBlock() [][]byte {
+	if e.claudeOpen == "" {
+		return nil
+	}
+	index := e.claudeIndex
+	kind := e.claudeOpen
+	e.claudeOpen = ""
+	e.claudeIndex++
+	return [][]byte{qoderAnthropicEvent("content_block_stop", map[string]any{"type": "content_block_stop", "index": index, "content_block": map[string]any{"type": kind}})}
+}
+
+func (e *qoderStreamEmitter) claudeToolDone(toolCalls []qoderToolCall) [][]byte {
+	out := make([][]byte, 0, len(toolCalls)*3)
+	for _, call := range toolCalls {
+		index := e.claudeIndex
+		e.claudeIndex++
+		out = append(out,
+			qoderAnthropicEvent("content_block_start", map[string]any{"type": "content_block_start", "index": index, "content_block": map[string]any{"type": "tool_use", "id": valueOrDefault(call.ID, fmt.Sprintf("call_%d", call.Index)), "name": call.Name, "input": map[string]any{}}}),
+			qoderAnthropicEvent("content_block_delta", map[string]any{"type": "content_block_delta", "index": index, "delta": map[string]any{"type": "input_json_delta", "partial_json": call.Arguments}}),
+			qoderAnthropicEvent("content_block_stop", map[string]any{"type": "content_block_stop", "index": index}),
+		)
+	}
+	return out
 }
 
 func (e *qoderStreamEmitter) responseEvent(eventType string, payload map[string]any) map[string]any {
