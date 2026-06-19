@@ -288,6 +288,65 @@ func TestBuildQoderBodyFromPayloadPreservesMessagesToolsAndImages(t *testing.T) 
 	}
 }
 
+func TestQoderPayloadStats(t *testing.T) {
+	payload := []byte(`{
+	  "messages": [
+	    {"role":"system","content":"sys"},
+	    {"role":"user","content":[{"type":"text","text":"hello"},{"type":"image_url","image_url":{"url":"https://example.com/a.png"}}]},
+	    {"role":"assistant","content":[{"type":"thinking","thinking":"plan"},{"type":"text","text":"done"}]},
+	    {"role":"tool","name":"Read","tool_call_id":"call_1","content":"ok"}
+	  ],
+	  "tools": [{"name":"Read","input_schema":{"type":"object"}}]
+	}`)
+	stats := qoderPayloadStats(payload)
+	if stats.Messages != 4 {
+		t.Fatalf("messages = %d, want 4", stats.Messages)
+	}
+	if stats.SystemMessages != 1 || stats.UserMessages != 1 || stats.AssistantMessages != 1 || stats.ToolMessages != 1 {
+		t.Fatalf("role counts mismatch: %+v", stats)
+	}
+	if stats.Tools != 1 {
+		t.Fatalf("tools = %d, want 1", stats.Tools)
+	}
+	if stats.Images != 1 {
+		t.Fatalf("images = %d, want 1", stats.Images)
+	}
+	if !stats.HasThinking {
+		t.Fatal("expected HasThinking=true")
+	}
+}
+
+func TestQoderPreviewMessages(t *testing.T) {
+	messages := gjson.Parse(`[
+	  {"role":"system","content":"sys"},
+	  {"role":"assistant","content":"answer","tool_calls":[{"id":"call_1"}]}
+	]`)
+	got := qoderPreviewMessages(messages)
+	want := "system(content=3,toolCalls=0,contents=0); assistant(content=6,toolCalls=1,contents=0)"
+	if got != want {
+		t.Fatalf("preview = %q, want %q", got, want)
+	}
+}
+
+func TestQoderCompactLogString(t *testing.T) {
+	got := qoderCompactLogString("  line1\n line2\tline3  ", 20)
+	if got != "line1 line2 line3" {
+		t.Fatalf("compact = %q", got)
+	}
+	truncated := qoderCompactLogString("abcdefghijklmnopqrstuvwxyz", 10)
+	if truncated != "abcdefghij...(truncated)" {
+		t.Fatalf("truncated = %q", truncated)
+	}
+}
+
+func TestFirstNonEmptyHeader(t *testing.T) {
+	header := http.Header{}
+	header.Set("X-Trace-Id", "trace-123")
+	if got := firstNonEmptyHeader(header, "X-Request-Id", "X-Trace-Id"); got != "trace-123" {
+		t.Fatalf("header = %q, want trace-123", got)
+	}
+}
+
 func TestBuildQoderBodyFromPayloadParsesAssistantToolCallsText(t *testing.T) {
 	payload := []byte(`{
 	  "messages": [

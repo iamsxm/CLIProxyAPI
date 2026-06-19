@@ -116,14 +116,15 @@ func (e *QoderExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	if opts.Alt == "responses/compact" {
 		return resp, statusErr{code: http.StatusNotImplemented, msg: "/responses/compact not supported by qoder"}
 	}
+	traceID := qoderShortID()
 	baseModel := e.resolveQoderModel(ctx, auth, req.Model)
 	reporter := helps.NewUsageReporter(ctx, e.Identifier(), baseModel, auth)
 	defer reporter.TrackFailure(ctx, &err)
 
 	payload := qoderRequestPayload(req, opts)
 	prompt := qoderPromptForRequest(req, opts)
-	traceID := qoderShortID()
 	log.Infof("qoder request start trace=%s stream=false model=%s promptChars=%d", traceID, baseModel, len(prompt))
+	logQoderRequestDiagnostics(traceID, req.Model, baseModel, payload, opts)
 
 	completion := newQoderCompletion()
 	begin := time.Now()
@@ -140,14 +141,15 @@ func (e *QoderExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 // ExecuteStream converts Qoder deltas into the streaming envelope expected by
 // OpenAI chat completions, OpenAI Responses, or Anthropic Messages handlers.
 func (e *QoderExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (_ *cliproxyexecutor.StreamResult, err error) {
+	traceID := qoderShortID()
 	baseModel := e.resolveQoderModel(ctx, auth, req.Model)
 	reporter := helps.NewUsageReporter(ctx, e.Identifier(), baseModel, auth)
 	defer reporter.TrackFailure(ctx, &err)
 
 	payload := qoderRequestPayload(req, opts)
 	prompt := qoderPromptForRequest(req, opts)
-	traceID := qoderShortID()
 	log.Infof("qoder request start trace=%s stream=true format=%s model=%s promptChars=%d", traceID, opts.SourceFormat.String(), baseModel, len(prompt))
+	logQoderRequestDiagnostics(traceID, req.Model, baseModel, payload, opts)
 
 	httpResp, err := e.openQoderStream(ctx, auth, baseModel, prompt, payload, traceID)
 	if err != nil {
@@ -217,6 +219,7 @@ func (e *QoderExecutor) openQoderStream(ctx context.Context, auth *cliproxyauth.
 	if err != nil {
 		return nil, err
 	}
+	logQoderBodyDiagnostics(traceID, model, modelSource, body)
 	encodedBody, err := qoderEncode(body)
 	if err != nil {
 		return nil, err
@@ -254,13 +257,28 @@ func (e *QoderExecutor) openQoderStream(ctx context.Context, auth *cliproxyauth.
 	})
 	log.Debugf("qoder upstream start trace=%s model=%s encodedBodyChars=%d", traceID, model, len(encodedBody))
 
-	httpClient := helps.NewProxyAwareHTTPClient(reqCtx, e.cfg, auth, qoderRequestTimeout)
+	// NOTE: Do NOT set http.Client.Timeout for SSE streaming requests.
+	// The http.Client.Timeout covers the ENTIRE request including reading the
+	// streaming response body, which can take minutes for long LLM generations.
+	// Instead, rely on qoderStreamIdleTimeout (120s) in consumeQoderDeltaStream
+	// for idle detection, and the request context for cancellation.
+	httpClient := helps.NewProxyAwareHTTPClient(reqCtx, e.cfg, auth, 0)
+	// Set ResponseHeaderTimeout to bound the connection + response-headers phase
+	// without affecting the streaming body read.
+	if httpClient.Transport == nil {
+		httpClient.Transport = &http.Transport{
+			ResponseHeaderTimeout: qoderRequestTimeout,
+		}
+	} else if t, ok := httpClient.Transport.(*http.Transport); ok {
+		t.ResponseHeaderTimeout = qoderRequestTimeout
+	}
 	httpResp, err := httpClient.Do(httpReq)
 	if err != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, err)
 		return nil, err
 	}
 	helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
+	log.Debugf("qoder upstream response trace=%s status=%d contentType=%q requestID=%q", traceID, httpResp.StatusCode, httpResp.Header.Get("Content-Type"), firstNonEmptyHeader(httpResp.Header, "X-Request-Id", "X-Qoder-Request-Id", "X-Trace-Id"))
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
 		defer httpResp.Body.Close()
 		b, _ := io.ReadAll(httpResp.Body)
@@ -476,6 +494,12 @@ func buildQoderBody(model, prompt, userType string) ([]byte, string, error) {
 			return nil, "", err
 		}
 	}
+	// qmodel_latest is a reasoning model — flag it so the upstream enables
+	// thinking/chain-of-thought output (mirrors qoder2api JS buildQoderBody).
+	if model == "qmodel_latest" {
+		body, _ = sjson.SetBytes(body, "model_config.is_reasoning", true)
+		body, _ = sjson.SetBytes(body, "chat_context.extra.modelConfig.is_reasoning", true)
+	}
 	body, err = qoderReplaceUserMessages(body, prompt)
 	if err != nil {
 		return nil, "", err
@@ -511,12 +535,73 @@ func buildQoderBodyFromPayload(model, prompt, userType string, payload []byte) (
 		return nil, "", err
 	}
 	if tools := gjson.GetBytes(payload, "tools"); tools.IsArray() && len(tools.Array()) > 0 {
-		body, err = sjson.SetRawBytes(body, "tools", []byte(tools.Raw))
-		if err != nil {
-			return nil, "", err
+		convertedTools := qoderConvertAnthropicToolsToOpenAI(tools)
+		if len(convertedTools) > 0 {
+			body, err = sjson.SetRawBytes(body, "tools", convertedTools)
+			if err != nil {
+				return nil, "", err
+			}
 		}
 	}
 	return body, modelSource, nil
+}
+
+// qoderConvertAnthropicToolsToOpenAI converts Anthropic/Claude tool definitions
+// to the OpenAI format expected by the Qoder upstream.
+// Anthropic: {"name":"...","description":"...","input_schema":{...}}
+// OpenAI:    {"type":"function","function":{"name":"...","description":"...","parameters":{...}}}
+// Tools already in OpenAI format (with "function" key) are passed through unchanged.
+func qoderConvertAnthropicToolsToOpenAI(tools gjson.Result) []byte {
+	if !tools.IsArray() {
+		return nil
+	}
+	arr := tools.Array()
+	if len(arr) == 0 {
+		return nil
+	}
+	out := make([]map[string]any, 0, len(arr))
+	for _, t := range arr {
+		// Already in OpenAI format (has "function" object)
+		if t.Get("function").Exists() && t.Get("function").IsObject() {
+			var raw map[string]any
+			if err := json.Unmarshal([]byte(t.Raw), &raw); err == nil {
+				out = append(out, raw)
+				continue
+			}
+		}
+		name := t.Get("name").String()
+		if name == "" {
+			continue
+		}
+		description := t.Get("description").String()
+		// Anthropic uses "input_schema"; OpenAI uses "parameters"
+		parameters := t.Get("input_schema")
+		if !parameters.Exists() || !parameters.IsObject() {
+			parameters = t.Get("parameters")
+		}
+		var params any
+		if parameters.Exists() && parameters.IsObject() {
+			_ = json.Unmarshal([]byte(parameters.Raw), &params)
+		} else {
+			params = map[string]any{"type": "object", "properties": map[string]any{}}
+		}
+		out = append(out, map[string]any{
+			"type": "function",
+			"function": map[string]any{
+				"name":        name,
+				"description": description,
+				"parameters":  params,
+			},
+		})
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	data, err := json.Marshal(out)
+	if err != nil {
+		return nil
+	}
+	return data
 }
 
 // qoderBuildMessagesFromPayload converts OpenAI Chat messages to the Qoder
@@ -931,8 +1016,15 @@ func consumeQoderDeltaStream(ctx context.Context, body io.Reader, traceID string
 			if !strings.HasPrefix(line, "data:") {
 				continue
 			}
+			dataPayload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+			// Upstream end-of-stream sentinel — terminate promptly instead of
+			// waiting for the idle timer or EOF (mirrors qoder2api JS behavior).
+			if strings.Contains(dataPayload, "[DONE]") {
+				log.Debugf("qoder stream complete trace=%s reason=done_sentinel lines=%d outputChars=%d", traceID, lines, textChars)
+				return nil
+			}
 			lines++
-			delta, errDelta := extractQoderDelta(strings.TrimSpace(strings.TrimPrefix(line, "data:")))
+			delta, errDelta := extractQoderDelta(dataPayload)
 			if errDelta != nil {
 				return errDelta
 			}
@@ -964,7 +1056,7 @@ func extractQoderDelta(dataLine string) (qoderDelta, error) {
 		if qoderIsQuotaExhaustedError(code) || qoderIsQuotaExhaustedError(msg) {
 			return qoderDelta{}, statusErr{code: http.StatusTooManyRequests, msg: "qoder quota exhausted: " + msg}
 		}
-		log.Warnf("qoder upstream error code=%s message=%s", code, msg)
+		log.Warnf("qoder upstream error code=%s message=%s body=%s", code, msg, qoderCompactLogString(inner, 800))
 		return qoderDelta{}, nil
 	}
 	var out qoderDelta
@@ -1523,6 +1615,156 @@ func qoderNormalizeModel(model string) string {
 
 func qoderShortID() string {
 	return strings.ReplaceAll(uuid.NewString(), "-", "")[:12]
+}
+
+func logQoderRequestDiagnostics(traceID, requestedModel, resolvedModel string, payload []byte, opts cliproxyexecutor.Options) {
+	if !log.IsLevelEnabled(log.DebugLevel) {
+		return
+	}
+	stats := qoderPayloadStats(payload)
+	log.Debugf(
+		"qoder request detail trace=%s sourceFormat=%s responseFormat=%s requestedModel=%q resolvedModel=%q payloadBytes=%d messages=%d system=%d user=%d assistant=%d tool=%d tools=%d images=%d thinking=%t",
+		traceID,
+		opts.SourceFormat.String(),
+		cliproxyexecutor.ResponseFormatOrSource(opts).String(),
+		requestedModel,
+		resolvedModel,
+		len(payload),
+		stats.Messages,
+		stats.SystemMessages,
+		stats.UserMessages,
+		stats.AssistantMessages,
+		stats.ToolMessages,
+		stats.Tools,
+		stats.Images,
+		stats.HasThinking,
+	)
+}
+
+func logQoderBodyDiagnostics(traceID, model, modelSource string, body []byte) {
+	if !log.IsLevelEnabled(log.DebugLevel) {
+		return
+	}
+	messages := gjson.GetBytes(body, "messages")
+	tools := gjson.GetBytes(body, "tools")
+	log.Debugf(
+		"qoder upstream payload trace=%s model=%q modelSource=%q bodyBytes=%d bodyMessages=%d bodyTools=%d chatTextChars=%d preview=%s",
+		traceID,
+		model,
+		modelSource,
+		len(body),
+		len(messages.Array()),
+		len(tools.Array()),
+		len(gjson.GetBytes(body, "chat_context.text.text").String()),
+		qoderCompactLogString(qoderPreviewMessages(messages), 500),
+	)
+}
+
+type qoderPayloadDiagnostic struct {
+	Messages          int
+	SystemMessages    int
+	UserMessages      int
+	AssistantMessages int
+	ToolMessages      int
+	Tools             int
+	Images            int
+	HasThinking       bool
+}
+
+func qoderPayloadStats(payload []byte) qoderPayloadDiagnostic {
+	var stats qoderPayloadDiagnostic
+	if !gjson.ValidBytes(payload) {
+		return stats
+	}
+	messages := gjson.GetBytes(payload, "messages")
+	if messages.IsArray() {
+		stats.Messages = len(messages.Array())
+		messages.ForEach(func(_, msg gjson.Result) bool {
+			role := strings.ToLower(strings.TrimSpace(msg.Get("role").String()))
+			switch role {
+			case "system":
+				stats.SystemMessages++
+			case "user":
+				stats.UserMessages++
+			case "assistant":
+				stats.AssistantMessages++
+			case "tool":
+				stats.ToolMessages++
+			}
+			stats.Images += len(qoderExtractImageParts(msg))
+			if qoderMessageHasThinking(msg) {
+				stats.HasThinking = true
+			}
+			return true
+		})
+	}
+	if tools := gjson.GetBytes(payload, "tools"); tools.IsArray() {
+		stats.Tools = len(tools.Array())
+	}
+	return stats
+}
+
+func qoderMessageHasThinking(msg gjson.Result) bool {
+	if strings.TrimSpace(msg.Get("reasoning_content").String()) != "" || strings.TrimSpace(msg.Get("reasoning").String()) != "" {
+		return true
+	}
+	content := msg.Get("content")
+	if !content.IsArray() {
+		return false
+	}
+	found := false
+	content.ForEach(func(_, block gjson.Result) bool {
+		blockType := strings.ToLower(strings.TrimSpace(block.Get("type").String()))
+		if blockType == "thinking" || strings.TrimSpace(block.Get("thinking").String()) != "" {
+			found = true
+			return false
+		}
+		return true
+	})
+	return found
+}
+
+func qoderPreviewMessages(messages gjson.Result) string {
+	if !messages.IsArray() {
+		return ""
+	}
+	parts := make([]string, 0, len(messages.Array()))
+	messages.ForEach(func(_, msg gjson.Result) bool {
+		role := valueOrDefault(msg.Get("role").String(), "unknown")
+		contentLen := len(msg.Get("content").String())
+		toolCalls := len(msg.Get("tool_calls").Array())
+		contents := len(msg.Get("contents").Array())
+		parts = append(parts, fmt.Sprintf("%s(content=%d,toolCalls=%d,contents=%d)", role, contentLen, toolCalls, contents))
+		return len(parts) < 8
+	})
+	return strings.Join(parts, "; ")
+}
+
+func qoderCompactLogString(value string, max int) string {
+	if max <= 0 {
+		return ""
+	}
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	replacer := strings.NewReplacer("\r", " ", "\n", " ", "\t", " ")
+	value = replacer.Replace(value)
+	value = strings.Join(strings.Fields(value), " ")
+	runes := []rune(value)
+	if len(runes) <= max {
+		return value
+	}
+	return string(runes[:max]) + "...(truncated)"
+}
+
+func firstNonEmptyHeader(header http.Header, keys ...string) string {
+	for _, key := range keys {
+		if value := strings.TrimSpace(header.Get(key)); value != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 func valueOrDefault(value, fallback string) string {
