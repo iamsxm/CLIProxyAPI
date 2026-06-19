@@ -184,6 +184,54 @@ func TestQoderOpenAIStreamEmitsContentAndToolCallsTogether(t *testing.T) {
 	}
 }
 
+func TestQoderOpenAIStreamToolCallIDsDoNotGetOverwrittenByEmptyFragments(t *testing.T) {
+	emitter := newQoderStreamEmitter("openai", "lite")
+	first := emitter.delta(qoderDelta{ToolCalls: []qoderToolCallDelta{{
+		Index:     0,
+		IDPresent: true,
+		Type:      "function",
+		Name:      "read",
+		Arguments: `{"path":`,
+	}}})
+	if got := gjson.GetBytes(first[0], "choices.0.delta.tool_calls.0.id").String(); got != "" {
+		t.Fatalf("first empty id = %q, want empty string; body=%s", got, string(first[0]))
+	}
+	if !gjson.GetBytes(first[0], "choices.0.delta.tool_calls.0.id").Exists() {
+		t.Fatalf("first empty id should be emitted once; body=%s", string(first[0]))
+	}
+	if got := gjson.GetBytes(first[0], "choices.0.delta.tool_calls.0.function.name").String(); got != "read" {
+		t.Fatalf("first function name = %q, want read; body=%s", got, string(first[0]))
+	}
+
+	second := emitter.delta(qoderDelta{ToolCalls: []qoderToolCallDelta{{
+		Index:     0,
+		ID:        "call_1",
+		IDPresent: true,
+		Type:      "function",
+		Name:      "read",
+		Arguments: `"README.md"}`,
+	}}})
+	if got := gjson.GetBytes(second[0], "choices.0.delta.tool_calls.0.id").String(); got != "call_1" {
+		t.Fatalf("real id = %q, want call_1; body=%s", got, string(second[0]))
+	}
+	if gjson.GetBytes(second[0], "choices.0.delta.tool_calls.0.type").Exists() {
+		t.Fatalf("type should not be repeated after first fragment; body=%s", string(second[0]))
+	}
+	if gjson.GetBytes(second[0], "choices.0.delta.tool_calls.0.function.name").Exists() {
+		t.Fatalf("name should not be repeated after first fragment; body=%s", string(second[0]))
+	}
+
+	third := emitter.delta(qoderDelta{ToolCalls: []qoderToolCallDelta{{
+		Index:     0,
+		IDPresent: true,
+		Type:      "function",
+		Arguments: "",
+	}}})
+	if gjson.GetBytes(third[0], "choices.0.delta.tool_calls.0.id").Exists() {
+		t.Fatalf("empty id should not overwrite the real id; body=%s", string(third[0]))
+	}
+}
+
 func TestBuildQoderBody(t *testing.T) {
 	body, source, err := buildQoderBody("lite", "hello", "personal_standard")
 	if err != nil {
@@ -243,7 +291,8 @@ func TestBuildQoderBodyFromPayloadPreservesMessagesToolsAndImages(t *testing.T) 
 func TestBuildQoderBodyFromPayloadParsesAssistantToolCallsText(t *testing.T) {
 	payload := []byte(`{
 	  "messages": [
-	    {"role":"assistant","content":"Tool calls: [{\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"read\",\"arguments\":{\"path\":\"README.md\"}}}]"}
+	    {"role":"assistant","content":"Tool calls: [{\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"read\",\"arguments\":{\"path\":\"README.md\"}}}]"},
+	    {"role":"tool","tool_call_id":"call_1","name":"read","content":"ok"}
 	  ],
 	  "tools": [{"type":"function","function":{"name":"read","parameters":{"type":"object"}}}]
 	}`)
@@ -256,6 +305,29 @@ func TestBuildQoderBodyFromPayloadParsesAssistantToolCallsText(t *testing.T) {
 	}
 	if got := gjson.GetBytes(body, "messages.1.content").String(); got != "" {
 		t.Fatalf("assistant fallback content = %q, want empty; body=%s", got, string(body))
+	}
+	if got := gjson.GetBytes(body, "messages.2.tool_call_id").String(); got != "call_1" {
+		t.Fatalf("tool_call_id = %q, want call_1; body=%s", got, string(body))
+	}
+}
+
+func TestBuildQoderBodyFromPayloadSummarizesUnresolvedToolCalls(t *testing.T) {
+	payload := []byte(`{
+	  "messages": [
+	    {"role":"assistant","content":"calling","tool_calls":[{"id":"call_1","type":"function","function":{"name":"read","arguments":{"path":"README.md"}}}]},
+	    {"role":"user","content":"continue"}
+	  ],
+	  "tools": [{"type":"function","function":{"name":"read","parameters":{"type":"object"}}}]
+	}`)
+	body, _, err := buildQoderBodyFromPayload("qmodel_latest", "continue", "personal_standard", payload)
+	if err != nil {
+		t.Fatalf("buildQoderBodyFromPayload error: %v", err)
+	}
+	if gjson.GetBytes(body, "messages.1.tool_calls").Exists() {
+		t.Fatalf("unresolved tool_calls should not be preserved; body=%s", string(body))
+	}
+	if got := gjson.GetBytes(body, "messages.1.content").String(); got != "Previously planned but unexecuted tool calls: read." {
+		t.Fatalf("unresolved tool call summary = %q; body=%s", got, string(body))
 	}
 }
 

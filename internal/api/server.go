@@ -717,6 +717,7 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.PUT("/qoder", s.mgmt.PutQoderCompat)
 		mgmt.PATCH("/qoder", s.mgmt.PatchQoderCompat)
 		mgmt.DELETE("/qoder", s.mgmt.DeleteQoderCompat)
+		mgmt.POST("/qoder/models", s.mgmt.GetQoderModels)
 
 		mgmt.GET("/vertex-api-key", s.mgmt.GetVertexCompatKeys)
 		mgmt.PUT("/vertex-api-key", s.mgmt.PutVertexCompatKeys)
